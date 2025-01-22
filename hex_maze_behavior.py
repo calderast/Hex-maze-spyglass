@@ -32,18 +32,18 @@ class HexMazeConfig(dj.Computed):
         Converts a set of ints to a sorted, comma-separated string.
         Used for going from a set of barrier locations to a query-able config_id.
         """
-        return ", ".join(map(str, sorted(set)))
+        return ",".join(map(str, sorted(set)))
     
     def string_to_set(string):
         """
         Converts a sorted, comma-separated string to a set of ints.
         Used for going from a config_id to a set of barrier locations.
         """
-        return set(map(int, string.split(", ")))
+        return set(map(int, string.split(",")))
     
     def make(self, key):
         """
-        Calculate secondary keys (maze attibutes) based on the primary key (config_id)
+        Calculate secondary keys (maze attributes) based on the primary key (config_id)
         and add them to the HexMazeConfig table.
         """
         # calculate secondary keys based on key
