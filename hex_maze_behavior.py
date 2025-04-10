@@ -4,19 +4,27 @@ sys.path.append('hex_maze')
 from pynwb import NWBHDF5IO
 import datajoint as dj
 import numpy as np
-from spyglass.common import Nwbfile, TaskEpoch
+from spyglass.common import Nwbfile, TaskEpoch, IntervalList, Session
 from spyglass.utils.dj_mixin import SpyglassMixin
 
 from hex_maze.hex_maze_utils import get_maze_attributes
 
 schema = dj.schema("hex_maze")
 
+def populate_all_hexmaze(nwb_file_name):
+    """Insert all hex maze related tables for a given NWB file"""
+    
+    # Populate the HexMazeBlock table, Trial part table, and HexMazeConfig table
+    HexMazeBlock().load_from_nwb(nwb_file_name)
+    # Populate the HexCentroids table
+    HexCentroids.populate({'nwb_file_name': nwb_file_name})
+
+
 @schema
 class HexMazeConfig(SpyglassMixin, dj.Manual):
     """
-    populate config table each time we get a new maze config
-    make secondary keys everything we want to look up by and 
-    potentially filter trials by
+    Contains data for each hex maze configuration, defined as the hexes where
+    movable barriers are placed in the hex maze.
     
     TODO: add num_dead_ends: int      # number of dead ends at least 3 hexes deep
     """
@@ -30,7 +38,7 @@ class HexMazeConfig(SpyglassMixin, dj.Manual):
     path_length_diff: int   # max path length difference between lenAB, lenBC, lenAC
     num_choice_points: int  # number of critical choice points for this maze config
     num_cycles: int         # number of graph cycles (closed loops) for this maze config
-    choice_points: longblob # list of hexes that are choice points (not query-able)
+    choice_points: blob     # list of hexes that are choice points (not query-able)
     """
     
     @staticmethod
@@ -79,7 +87,7 @@ class HexMazeConfig(SpyglassMixin, dj.Manual):
 class HexMazeBlock(SpyglassMixin, dj.Manual):
     """
     Contains data for each block in the Hex Maze task.
-    Calling load_from_nwb to populate this table automatically also
+    Calling load_from_nwb to populate this table also
     populates the Trial part table and HexMazeConfig table.
 
     HexMazeBlock inherits primary keys nwb_file_name and epoch from TaskEpoch, 
@@ -95,7 +103,7 @@ class HexMazeBlock(SpyglassMixin, dj.Manual):
     p_b: float                      # probability of reward at port B
     p_c: float                      # probability of reward at port C
     num_trials: int                 # number of trials in this block
-    block_interval: longblob        # np.array of [start_time, end_time]
+    block_interval: IntervalList    # [start_time, end_time] defining block bounds
     task_type: varchar(64)          # 'barrier shift' or 'probabilty shift'
     """
 
@@ -103,7 +111,7 @@ class HexMazeBlock(SpyglassMixin, dj.Manual):
         """
         Contains data for each trial within a block in the Hex Maze task.
         This is a part table based on HexMazeBlock.
-        
+
         Trial inherits primary keys nwb_file_name and epoch from TaskEpoch, 
         and block from HexMazeBlock
         """
@@ -117,18 +125,18 @@ class HexMazeBlock(SpyglassMixin, dj.Manual):
         start_port: varchar(5)          # A, B, or C
         end_port: varchar(5)            # A, B, or C
         opto_cond=NULL: varchar(64)     # description of opto condition, if any (delay / no_delay)
-        trial_interval: longblob        # np.array of [start_time, end_time]
-        poke_interval: longblob         # np.array of [poke_in, poke_out]
+        trial_interval: IntervalList    # [start_time, end_time] defining trial bounds
+        poke_interval: blob             # np.array of [poke_in, poke_out]
         duration: float                 # trial duration in seconds
         """
 
     def load_from_nwb(self, nwb_file_name):
 
         nwb_file_path = Nwbfile().get_abs_path(nwb_file_name)
-        
+
         with NWBHDF5IO(nwb_file_path, 'r') as io:
             nwbfile = io.read()
-        
+
             # Get trial and block data from the nwb
             block_data = nwbfile.intervals["block"].to_dataframe()
             trial_data = nwbfile.intervals["trials"].to_dataframe()
@@ -137,7 +145,17 @@ class HexMazeBlock(SpyglassMixin, dj.Manual):
                 # Add maze for this block to the HexMazeConfig table
                 HexMazeConfig().insert_config({"config_id": block.maze_configuration})
 
-                # Add each block to the HexMazeBlock table
+                # Add the block interval to the IntervalList table
+                IntervalList.insert1(
+                    {
+                        "nwb_file_name": nwb_file_name,
+                        "interval_list_name": f"epoch{block.epoch}_block{block.block}",
+                        "valid_times": np.array([block.start_time, block.stop_time]),
+                        "pipeline": "hex_maze"
+                    }, skip_duplicates=True
+                )
+
+                # Add the block to the HexMazeBlock table
                 block_key = {
                     'nwb_file_name': nwb_file_name,
                     'epoch': block.epoch,
@@ -147,13 +165,24 @@ class HexMazeBlock(SpyglassMixin, dj.Manual):
                     'p_b': block.pB,
                     'p_c': block.pC,
                     'num_trials': block.num_trials,
-                    'block_interval': np.array([block.start_time, block.stop_time]),
+                    'block_interval': f"epoch{block.epoch}_block{block.block}",
                     'task_type': block.task_type
                 }
                 self.insert1(block_key, skip_duplicates=True)
- 
-            # After populating the HexMazeBlock table, add trials
+
+            # After populating the HexMazeBlock table, add each trial to the Trial part table
+            trials_to_insert = []
             for trial in trial_data.itertuples():
+
+                # Insert the trial interval into the IntervalList table
+                IntervalList.insert1(
+                    {
+                        "nwb_file_name": nwb_file_name,
+                        "interval_list_name": f"epoch{trial.epoch}_block{trial.block}_trial{trial.trial_within_block}",
+                        "valid_times": np.array([trial.start_time, trial.stop_time]),
+                        "pipeline": "hex_maze"
+                    }, skip_duplicates=True
+                )
 
                 # Add each trial to the Trial part table
                 trial_key = {
@@ -166,10 +195,84 @@ class HexMazeBlock(SpyglassMixin, dj.Manual):
                     'start_port': trial.start_port,
                     'end_port': trial.end_port,
                     'opto_cond': trial.opto_condition,
-                    'trial_interval': np.array([trial.start_time, trial.stop_time]),
+                    'trial_interval': f"epoch{trial.epoch}_block{trial.block}_trial{trial.trial_within_block}",
                     'poke_interval': np.array([trial.poke_in, trial.poke_out]),
-                    'duration':  trial.duration
+                    'duration': trial.duration
                 }
-                HexMazeBlock.Trial.insert1(trial_key, skip_duplicates=True)
+                trials_to_insert.append(trial_key)
 
+            HexMazeBlock.Trial.insert(trials_to_insert, skip_duplicates=True)
+
+
+@schema
+class HexCentroids(dj.Imported):
+    """
+    Contains hex centroids for each session for the hex maze task in video pixel coordinates
+    Used for assigning x, y position to a hex
+    """
+
+    definition = """
+    -> Session           
+    hex: int    # the hex ID in the hex maze (1-49)
+    ---
+    x: float    # the x coordinate of the x centroid, in video pixel coordinates
+    y: float    # the y coordinate of the x centroid, in video pixel coordinates
+    """
+
+    def make(self, key):
+        # Load hex centroids from the NWB file
+        nwb_file_path = Nwbfile().get_abs_path(key["nwb_file_name"])
+        with NWBHDF5IO(nwb_file_path, mode="r") as io:
+            nwbfile = io.read()
+            behavior_module = nwbfile.processing["behavior"]
+            centroids_data = behavior_module.data_interfaces["hex_centroids"].to_dataframe()
+        
+        centroids_to_insert = [
+        {
+            **key,
+            'hex': np.int(row.hex),
+            'x': row.x,
+            'y': row.y
+        }
+        for row in centroids_data.itertuples()
+        ]
+
+        self.insert(centroids_to_insert, skip_duplicates=True)
+
+    def return_closest_hex(self, session_key, x, y):
+        hex_ids = self & session_key
+
+
+# @schema
+# class HexMazePosition(SpyglassMixin, dj.Manual):
+#     """
+#     Contains data for each block in the Hex Maze task.
+#     Calling load_from_nwb to populate this table automatically also
+#     populates the Trial part table and HexMazeConfig table.
+
+#     HexMazeBlock inherits primary keys nwb_file_name and epoch from TaskEpoch, 
+#     and inherits secondary key config_id from HexMazeConfig
+#     """
+
+#     definition = """
+#     -> TaskEpoch                    # gives nwb_file_name and epoch
+#     block: int                      # the block number within the epoch
+#     ---
+#     -> HexMazeConfig                # gives config_id
+#     p_a: float                      # probability of reward at port A
+#     p_b: float                      # probability of reward at port B
+#     p_c: float                      # probability of reward at port C
+#     num_trials: int                 # number of trials in this block
+#     block_interval: longblob        # np.array of [start_time, end_time]
+#     task_type: varchar(64)          # 'barrier shift' or 'probabilty shift'
+#     """
+    
+
+
+ 
 # Future TODO: add an opto table
+
+
+# hex ID, dead end?, hexes from port, hexes to port, optimal path?,  choice point?
+
+# entry, exit,
