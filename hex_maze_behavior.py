@@ -1,9 +1,11 @@
 import sys
 sys.path.append('hex_maze')
 
-from pynwb import NWBHDF5IO
-import datajoint as dj
 import numpy as np
+import datajoint as dj
+from pynwb import NWBHDF5IO
+from scipy.spatial import KDTree
+import spyglass.common as sgc
 from spyglass.common import Nwbfile, TaskEpoch, IntervalList, Session
 from spyglass.utils.dj_mixin import SpyglassMixin
 
@@ -18,6 +20,8 @@ def populate_all_hexmaze(nwb_file_name):
     HexMazeBlock().load_from_nwb(nwb_file_name)
     # Populate the HexCentroids table
     HexCentroids.populate({'nwb_file_name': nwb_file_name})
+    
+    # Do hex assignment!!
 
 
 @schema
@@ -215,9 +219,44 @@ class HexCentroids(dj.Imported):
     -> Session           
     hex: int    # the hex ID in the hex maze (1-49)
     ---
-    x: float    # the x coordinate of the x centroid, in video pixel coordinates
-    y: float    # the y coordinate of the x centroid, in video pixel coordinates
+    x: float            # the x coordinate of the hex centroid, in video pixel coordinates
+    y: float            # the y coordinate of the hex centroid, in video pixel coordinates
+    x_meters: float     # the x coordinate of the hex centroid, in meters
+    y_meters: float     # the y coordinate of the hex centroid, in meters
     """
+
+    def get_side_hex_centroids(hex_centroids):
+        """
+        Given a dict of hex centroids, calculate the centroids of the 6 side half-hexes
+        near the reward ports (i.e. the sides to the left/right of hexes 4, 49, and 48)
+        """
+        def find_4th_hex_centroid_parallelogram(top_hex, middle_hex, bottom_hex):
+            """ 
+            Helper function used for finding centroids of the side half-hexes by reward ports.
+            
+            Given 3 (x,y) hex centroids top_hex, middle_hex, and bottom_hex, find the 
+            4th hex centroid such that the 4 hexes are arranged in a parallelogram.
+            
+            For example, to find the centroid of the side hex to the left of hex 4
+            (when facing the reward port), top_hex=1, middle_hex=4, bottom_hex=6.
+            
+            Note that 'top' and 'bottom' are relative and interchangeable - generally, I set
+            the 'top' hex as one of the reward ports. (it doesn't have to be 'top' and 'bottom' 
+            in an x,y coordinate sense, just 'middle' needs to be the hex between them)
+            """
+            other_middle_hex = np.array(top_hex) + (np.array(bottom_hex) - np.array(middle_hex))
+            return tuple(other_middle_hex)
+
+        # Calculate the centroids of the 6 side half-hexes next to the reward ports
+        hex4left = find_4th_hex_centroid_parallelogram(hex_centroids[1], hex_centroids[4], hex_centroids[6])
+        hex4right = find_4th_hex_centroid_parallelogram(hex_centroids[1], hex_centroids[4], hex_centroids[5])
+        hex49left = find_4th_hex_centroid_parallelogram(hex_centroids[2], hex_centroids[49], hex_centroids[47])
+        hex49right = find_4th_hex_centroid_parallelogram(hex_centroids[2], hex_centroids[49], hex_centroids[38])
+        hex48left = find_4th_hex_centroid_parallelogram(hex_centroids[3], hex_centroids[48], hex_centroids[33])
+        hex48right = find_4th_hex_centroid_parallelogram(hex_centroids[3], hex_centroids[48], hex_centroids[43])
+        # Return a dict of side hex centroids
+        return {"4_left": hex4left, "4_right": hex4right, "49_left": hex49left, "49_right": hex49right, 
+                "48_left": hex48left, "48_right": hex48right}
 
     def make(self, key):
         # Load hex centroids from the NWB file
@@ -226,13 +265,15 @@ class HexCentroids(dj.Imported):
             nwbfile = io.read()
             behavior_module = nwbfile.processing["behavior"]
             centroids_data = behavior_module.data_interfaces["hex_centroids"].to_dataframe()
-        
+    
         centroids_to_insert = [
         {
             **key,
             'hex': np.int(row.hex),
             'x': row.x,
-            'y': row.y
+            'y': row.y,
+            'x_meters': row.x_meters,
+            'y_meters': row.y_meters,
         }
         for row in centroids_data.itertuples()
         ]
@@ -240,36 +281,123 @@ class HexCentroids(dj.Imported):
         self.insert(centroids_to_insert, skip_duplicates=True)
 
     def return_closest_hex(self, session_key, x, y):
-        hex_ids = self & session_key
+        # Fetch the hex centroids for the given session
+        centroids = (self & session_key).fetch(order_by='hex')
+        hex_ids = np.array([entry['hex'] for entry in centroids])
+        positions = np.array([[entry['x'], entry['y']] for entry in centroids])
+
+        # Use KDTree to find the closest hex
+        tree = KDTree(positions)
+        _, idx = tree.query([x, y])
+        
+        # Return the hex ID corresponding to the closest position
+        return int(hex_ids[idx])
 
 
-# @schema
-# class HexMazePosition(SpyglassMixin, dj.Manual):
-#     """
-#     Contains data for each block in the Hex Maze task.
-#     Calling load_from_nwb to populate this table automatically also
-#     populates the Trial part table and HexMazeConfig table.
-
-#     HexMazeBlock inherits primary keys nwb_file_name and epoch from TaskEpoch, 
-#     and inherits secondary key config_id from HexMazeConfig
-#     """
-
-#     definition = """
-#     -> TaskEpoch                    # gives nwb_file_name and epoch
-#     block: int                      # the block number within the epoch
-#     ---
-#     -> HexMazeConfig                # gives config_id
-#     p_a: float                      # probability of reward at port A
-#     p_b: float                      # probability of reward at port B
-#     p_c: float                      # probability of reward at port C
-#     num_trials: int                 # number of trials in this block
-#     block_interval: longblob        # np.array of [start_time, end_time]
-#     task_type: varchar(64)          # 'barrier shift' or 'probabilty shift'
-#     """
+@schema
+class HexMazeTraversal(dj.Computed):
+    """
+    Stores each hex transition within a trial, including entry/exit times,
+    surrounding hexes, and distance to/from ports.
     
+    TODO: add fields choice_point, critical_choice_point, dead_end? optimal path?
+    open q- is 'hexes_from_optimal_path' equivalent to dead end/optimal path in one?
+    
+    newly available and newly blocked as properties of a maze
+    """
+
+    definition = """
+    -> HexMazeBlock.Trial
+    hex_in_trial: int
+    ---
+    entry_in_trial
+    hex: int
+    entry_time: float
+    exit_time: float
+    duration: float
+    from_hex: int
+    to_hex: int
+    hexes_from_port: int
+    hexes_to_port: int
+    # inverse maybe?
+    """
+
+    def make(self, key):
+        # Fetch trial info
+        trial_info = (HexMazeBlock.Trial & key).fetch1()
+        config_id = (HexMazeBlock & key).fetch1('config_id')
+
+        start_port = trial_info['start_port']
+        end_port = trial_info['end_port']
+
+        # Get the raw position data from sgc RawPosition table
+        # TODO change to posv1
+        trial_positions = (sgc.RawPosition() 
+                           & {"nwb_file_name": key['nwb_file_name'], 
+                              "interval_list_name": trial_info['trial_interval']}
+                          ).fetch1_dataframe()
+
+        # # Get the trial start and end times
+        # trial_interval = (IntervalList & {
+        #     'nwb_file_name': key['nwb_file_name'],
+        #     'interval_list_name': trial_info['trial_interval']
+        # }).fetch1('valid_times')
+        # trial_start, trial_end = trial_interval
+
+        # # Filter position data for the trial time interval (maybe not needed bc we did already??)
+        # trial_positions = raw_position_df[(raw_position_df.index >= trial_start) 
+        #                                   & (raw_position_df.index <= trial_end)]
+
+        # Get centroids
+        #centroids = (HexCentroids & {'nwb_file_name': key['nwb_file_name']}).fetch(as_dict=True)
+        #centroid_dict = {entry['hex']: np.array([entry['x'], entry['y']]) for entry in centroids}
+        
+        # Assign each position to a hex using HexCentroids method return_closest_hex
+        assigned_hexes = []
+        for _, pos in trial_positions[['x', 'y']].iterrows():
+            hex_id = HexCentroids().return_closest_hex(
+                session_key={'nwb_file_name': key['nwb_file_name'], 'config_id': config_id},
+                x=pos['x'], y=pos['y']
+            )
+            assigned_hexes.append(hex_id)
+
+        # Find transitions
+        entries = []
+        prev_hex = None
+        for i in range(1, len(assigned_hexes)):
+            if assigned_hexes[i] != assigned_hexes[i - 1]:
+                exit_time = timestamps[i]
+                entry_time = timestamps[i - 1]
+                from_hex = assigned_hexes[i - 1]
+                to_hex = assigned_hexes[i]
+                
+                # TODO: add a check for if the transition is valid.
+                # If not, hopefully the hex position has only jumped over 1 hex
+                # Assign a couple indices to the intermediate hex so we dont break things
+
+                hex_id = from_hex
+                hexes_from = calculate_hexes_from_port(hex_id, start_port, config_id)
+                hexes_to = calculate_hexes_to_port(hex_id, end_port, config_id)
+
+                entries.append({
+                    **key,
+                    'hex_index': len(entries),
+                    'hex': hex_id,
+                    'entry_time': entry_time,
+                    'exit_time': exit_time,
+                    'duration': exit_time - entry_time,
+                    'from_hex': prev_hex if prev_hex is not None else from_hex,
+                    'to_hex': to_hex,
+                    'hexes_from_port': hexes_from,
+                    'hexes_to_port': hexes_to,
+                })
+
+                prev_hex = from_hex
+
+        self.insert(entries)
 
 
- 
+
 # Future TODO: add an opto table
 
 
