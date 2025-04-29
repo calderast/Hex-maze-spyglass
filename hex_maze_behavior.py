@@ -1,6 +1,3 @@
-import sys
-sys.path.append('hex_maze')
-
 import numpy as np
 import datajoint as dj
 from pynwb import NWBHDF5IO
@@ -9,7 +6,7 @@ import spyglass.common as sgc
 from spyglass.common import Nwbfile, TaskEpoch, IntervalList, Session
 from spyglass.utils.dj_mixin import SpyglassMixin
 
-from hex_maze.hex_maze_utils import get_maze_attributes
+from hexmaze import get_maze_attributes
 
 schema = dj.schema("hex_maze")
 
@@ -29,8 +26,6 @@ class HexMazeConfig(SpyglassMixin, dj.Manual):
     """
     Contains data for each hex maze configuration, defined as the hexes where
     movable barriers are placed in the hex maze.
-    
-    TODO: add num_dead_ends: int      # number of dead ends at least 3 hexes deep
     """
 
     definition = """
@@ -43,24 +38,12 @@ class HexMazeConfig(SpyglassMixin, dj.Manual):
     num_choice_points: int  # number of critical choice points for this maze config
     num_cycles: int         # number of graph cycles (closed loops) for this maze config
     choice_points: blob     # list of hexes that are choice points (not query-able)
+    num_dead_ends: int      # number of dead ends at least 3 hexes long
+    optimal_pct: float      # percentage of maze hexes that are on optimal paths
+    non_optimal_pct: float  # percentage of maze hexes that are on non-optimal paths
+    dead_end_pct: float     # percentage of maze hexes that are on dead-end paths
     """
-    
-    @staticmethod
-    def set_to_string(set):
-        """
-        Converts a set of ints to a sorted, comma-separated string.
-        Used for going from a set of barrier locations to a query-able config_id.
-        """
-        return ",".join(map(str, sorted(set)))
-    
-    @staticmethod
-    def string_to_set(string):
-        """
-        Converts a sorted, comma-separated string to a set of ints.
-        Used for going from a config_id to a set of barrier locations.
-        """
-        return set(map(int, string.split(",")))
-    
+
     def insert_config(self, key):
         """
         Calculate secondary keys (maze attributes) based on the primary key (config_id)
@@ -70,7 +53,6 @@ class HexMazeConfig(SpyglassMixin, dj.Manual):
         config_id = key['config_id']
     
         # Calculate maze attributes for this maze
-        # TODO: Update hex_maze functions to use our new naming conventions, add num_dead_ends to this function
         maze_attributes = get_maze_attributes(config_id)
         
         # Add maze attributes to key dict
@@ -81,7 +63,11 @@ class HexMazeConfig(SpyglassMixin, dj.Manual):
             'path_length_diff': maze_attributes.get('path_length_difference'),
             'num_choice_points': maze_attributes.get('num_choice_points'),
             'num_cycles': maze_attributes.get('num_cycles'),
-            'choice_points': list(maze_attributes.get('choice_points'))
+            'choice_points': list(maze_attributes.get('choice_points')),
+            'num_dead_ends': maze_attributes.get('num_dead_ends_min_length_3'),
+            'optimal_pct': maze_attributes.get('optimal_pct'),
+            'non_optimal_pct': maze_attributes.get('non_optimal_pct'),
+            'dead_end_pct': maze_attributes.get('dead_end_pct'),
         })
 
         self.insert1(key, skip_duplicates=True)
