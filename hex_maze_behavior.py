@@ -251,7 +251,7 @@ class HexCentroids(dj.Imported):
             nwbfile = io.read()
             behavior_module = nwbfile.processing["behavior"]
             centroids_data = behavior_module.data_interfaces["hex_centroids"].to_dataframe()
-    
+
         centroids_to_insert = [
         {
             **key,
@@ -286,8 +286,7 @@ class HexMazeTraversal(dj.Computed):
     Stores each hex transition within a trial, including entry/exit times,
     surrounding hexes, and distance to/from ports.
     
-    TODO: add fields choice_point, critical_choice_point, dead_end? optimal path?
-    open q- is 'hexes_from_optimal_path' equivalent to dead end/optimal path in one?
+    TODO: add fields choice_point, critical_choice_point,
     
     newly available and newly blocked as properties of a maze
     """
@@ -296,15 +295,16 @@ class HexMazeTraversal(dj.Computed):
     -> HexMazeBlock.Trial
     hex_in_trial: int
     ---
-    entry_in_trial
-    hex: int
-    entry_time: float
-    exit_time: float
-    duration: float
-    from_hex: int
-    to_hex: int
-    hexes_from_port: int
-    hexes_to_port: int
+    entry_in_trial: int         # numbered entry into this hex for this trial (1 = first entry)
+    hex: int                    # the id of the hex
+    entry_time: float           # the time the rat entered this hex
+    exit_time: float            # the time the rat exited this hex
+    duration: float             # the amount of time spent in this hex during this entry
+    from_hex: int               # the id of the previous hex on the rat's path
+    to_hex: int                 # the id of the next hex on the rat's path
+    hexes_from_port: int        # the distance (in hexes) from the end port of this trial
+    hexes_to_port: int          # the distance (in hexes) from the start port of this trial
+    hex_type: varchar(20)       # optimal, non-optimal, or dead-end
     # inverse maybe?
     """
 
