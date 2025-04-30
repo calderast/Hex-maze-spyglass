@@ -203,12 +203,12 @@ class HexCentroids(dj.Imported):
 
     definition = """
     -> Session           
-    hex: int    # the hex ID in the hex maze (1-49)
+    hex: varchar(10)    # the hex ID in the hex maze (1-49)
     ---
-    x: float            # the x coordinate of the hex centroid, in video pixel coordinates
-    y: float            # the y coordinate of the hex centroid, in video pixel coordinates
-    x_meters: float     # the x coordinate of the hex centroid, in meters
-    y_meters: float     # the y coordinate of the hex centroid, in meters
+    x_pixels: float     # the x coordinate of the hex centroid, in video pixel coordinates
+    y_pixels: float     # the y coordinate of the hex centroid, in video pixel coordinates
+    x_cm: float         # the x coordinate of the hex centroid, in cm
+    y_cm: float         # the y coordinate of the hex centroid, in cm
     """
 
     def get_side_hex_centroids(hex_centroids):
@@ -250,27 +250,83 @@ class HexCentroids(dj.Imported):
         with NWBHDF5IO(nwb_file_path, mode="r") as io:
             nwbfile = io.read()
             behavior_module = nwbfile.processing["behavior"]
-            centroids_data = behavior_module.data_interfaces["hex_centroids"].to_dataframe()
+            centroids_df = behavior_module.data_interfaces["hex_centroids"].to_dataframe()
+            centroids_dict = centroids_df.set_index('hex')[['x', 'y']].apply(tuple, axis=1).to_dict()
+    
+        # ignore nwb x_meters and y_meters if exists
+        # we get conversion factor here
 
+        # Get the number of the first run epoch from the HexMazeBlock table
+        first_run_epoch = (HexMazeBlock() & {"nwb_file_name": key["nwb_file_name"]}).fetch('epoch')[0]
+        interval_list_name = f"pos {first_run_epoch} valid times"
+
+        # Get the raw position data for the first run epoch
+        raw_position = (sgc.RawPosition.PosObject & {"nwb_file_name": nwb_copy_file_name, 'interval_list_name':interval_list_name})
+        spatial_series = raw_position.fetch_nwb()[0]["raw_position"]
+
+        # Use the conversion factor from this spatial series (same for all run epochs in a session)
+        conversion_factor = spatial_series.conversion # {unit} per pixel
+        conversion_unit = spatial_series.unit # assumed to be meters or cm
+        if conversion_unit == "meters":
+            cm_per_pixel = conversion_factor*100
+        elif comversion_unit == "cm":
+            cm_per_pixel = conversion_factor
+        else:
+            print("no!")
+
+        # Insert the 49 hexes from the centroids table in the nwb
         centroids_to_insert = [
         {
             **key,
-            'hex': np.int(row.hex),
-            'x': row.x,
-            'y': row.y,
-            'x_meters': row.x_meters,
-            'y_meters': row.y_meters,
+            'hex': str(row.hex),
+            'x_pixels': row.x,
+            'y_pixels': row.y,
+            'x_cm': row.x*cm_per_pixel,
+            'y_cm': row.y*cm_per_pixel,
         }
-        for row in centroids_data.itertuples()
+        for row in centroids_df.itertuples()
         ]
-
         self.insert(centroids_to_insert, skip_duplicates=True)
 
+        # Insert the calculated centroids of the side half-hexes by reward ports
+        side_hex_centroids = get_side_hex_centroids(centroids_dict)
+        side_hex_centroids_to_insert = [
+        {
+            **key,
+            'hex': side_hex,
+            'x_pixels': side_hex_centroids.get(side_hex)[0],
+            'y_pixels': side_hex_centroids.get(side_hex)[1],
+            'x_cm': side_hex_centroids.get(side_hex)[0]*cm_per_pixel,
+            'y_cm': side_hex_centroids.get(side_hex)[1]*cm_per_pixel,
+        }
+        for side_hex in side_hex_centroids
+        ]
+        self.insert(side_hex_centroids_to_insert, skip_duplicates=True)
+        
+    
     def return_closest_hex(self, session_key, x, y):
         # Fetch the hex centroids for the given session
         centroids = (self & session_key).fetch(order_by='hex')
         hex_ids = np.array([entry['hex'] for entry in centroids])
-        positions = np.array([[entry['x'], entry['y']] for entry in centroids])
+        positions = np.array([[entry['x_cm'], entry['y_cm']] for entry in centroids])
+
+        # Use KDTree to find the closest hex
+        tree = KDTree(positions)
+        _, idx = tree.query([x, y])
+        
+        # Collapse side hexes into hex closest to port
+        # (matches the first integer in the string and returns it)
+        hex_number = int(re.match(r"\d+", hex_ids[idx]).group()) 
+
+        # Return the hex ID corresponding to the closest position
+        return hex_number
+    
+    
+    def return_closest_hex_including_sides(self, session_key, x, y):
+        # Fetch the hex centroids for the given session
+        centroids = (self & session_key).fetch(order_by='hex')
+        hex_ids = np.array([entry['hex'] for entry in centroids])
+        positions = np.array([[entry['x_cm'], entry['y_cm']] for entry in centroids])
 
         # Use KDTree to find the closest hex
         tree = KDTree(positions)
@@ -293,7 +349,7 @@ class HexMazeTraversal(dj.Computed):
 
     definition = """
     -> HexMazeBlock.Trial
-    hex_in_trial: int
+    hex_in_trial: int           # the nth hex entered in this trial
     ---
     entry_in_trial: int         # numbered entry into this hex for this trial (1 = first entry)
     hex: int                    # the id of the hex
@@ -307,6 +363,8 @@ class HexMazeTraversal(dj.Computed):
     hex_type: varchar(20)       # optimal, non-optimal, or dead-end
     # inverse maybe?
     """
+    
+    # TODO: how to classify hexes not on optimal path from from to to
 
     def make(self, key):
         # Fetch trial info
