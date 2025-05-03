@@ -1,11 +1,15 @@
-Note that this repo contains the [Hex-maze](https://github.com/calderast/Hex-maze) repo as a submodule
+Note that this repo uses functions from `hex-maze-neuro` (https://pypi.org/project/hex-maze-neuro/). 
+This requires python>=3.10.
 
-When cloning, use:
-```
-git clone --recurse-submodules git@github.com:calderast/Hex-maze-spyglass.git
+To use these functions, install via
+
+```bash
+pip install hex-maze-neuro
 ```
 
-If you forgot to use `--recurse-submodules` and already cloned, you can initialize and fetch the submodules like this:
-```
-git submodule update --init --recursive
+Then import functions from the package as follows:
+
+```python
+from hexmaze import plot_hex_maze
+plot_hex_maze(barriers={37, 7, 39, 41, 14, 46, 20, 23, 30}, show_barriers=False)
 ```
