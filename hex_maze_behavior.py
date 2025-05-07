@@ -239,6 +239,8 @@ class HexCentroids(dj.Imported):
     -> Session  
     ---
     """
+    
+    # TODO: helpers to return centroids without side hexes too
 
     @classmethod
     def get_hex_centroids_dict_cm(cls, session_key):
