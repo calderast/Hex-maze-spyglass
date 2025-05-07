@@ -1,10 +1,9 @@
 import numpy as np
 import datajoint as dj
 from pynwb import NWBHDF5IO
-from scipy.spatial import KDTree
 import spyglass.common as sgc
 from spyglass.common import Nwbfile, TaskEpoch, IntervalList, Session, AnalysisNwbfile
-from spyglass.position import  PositionOutput
+from spyglass.position import PositionOutput
 from spyglass.utils.dj_mixin import SpyglassMixin
 
 from hexmaze import get_maze_attributes
@@ -75,6 +74,8 @@ class HexMazeConfig(SpyglassMixin, dj.Manual):
 
         self.insert1(key, skip_duplicates=True)
 
+# NOTE IntervalList used to work for HexMazeBlock and HexMazeBlock.Trial, now does not and idk why.
+# Replaced with blob for now??
 
 @schema
 class HexMazeBlock(SpyglassMixin, dj.Manual):
@@ -118,7 +119,7 @@ class HexMazeBlock(SpyglassMixin, dj.Manual):
         start_port: varchar(5)          # A, B, or C
         end_port: varchar(5)            # A, B, or C
         opto_cond=NULL: varchar(64)     # description of opto condition, if any (delay / no_delay)
-        trial_interval: IntervalList    # [start_time, end_time] defining trial bounds
+        trial_interval: blob            # [start_time, end_time] defining trial bounds
         poke_interval: blob             # np.array of [poke_in, poke_out]
         duration: float                 # trial duration in seconds
         """
@@ -453,48 +454,7 @@ class HexPosition(SpyglassMixin, dj.Computed):
 
 
 ### ANYTHING BELOW HERE IS MY ROUGH NOTES
-        
 
-#     def return_closest_hex(self, session_key, x, y):
-#         # Fetch the hex centroids for the given session
-#         centroids = (self & session_key).fetch(order_by='hex')
-#         centroids = (HexCentroids() & 'nwb_file_name'))
-#         display(centroids)
-#         hex_ids = np.array([entry['hex'] for entry in centroids])
-#         positions = np.array([[entry['x_cm'], entry['y_cm']] for entry in centroids])
-
-#         # Use KDTree to find the closest hex
-#         tree = KDTree(positions)
-#         _, idx = tree.query([x, y])
-    
-#         # Collapse side hexes into hex closest to port
-#         # (matches the first integer in the string and returns it)
-#         hex_number = int(re.match(r"\d+", hex_ids[idx]).group()) 
-
-#         # Return the hex ID corresponding to the closest position
-#         return hex_number
-    
-    
-#     def return_closest_hex_including_sides(self, session_key, x, y):
-#         # Fetch the hex centroids for the given session
-#         centroids = (self & session_key).fetch(order_by='hex')
-#         hex_ids = np.array([entry['hex'] for entry in centroids])
-#         positions = np.array([[entry['x_cm'], entry['y_cm']] for entry in centroids])
-
-#         # Use KDTree to find the closest hex
-#         tree = KDTree(positions)
-#         _, idx = tree.query([x, y])
-        
-#         # Return the hex ID corresponding to the closest position
-#         return int(hex_ids[idx])
-    
-
-
-
-    # def fetch1_dataframe(self) -> pd.DataFrame:
-    #     if not len(nwb := self.fetch_nwb()):
-    #         raise ValueError("fetch1_dataframe must be called on a single key")
-    #     return nwb[0].set_index("time") # how to fetch dataframe here?
 
 #@schema
 # class HexMazeTraversal(dj.Manual):
