@@ -101,8 +101,6 @@ class HexMazeConfig(SpyglassMixin, dj.Manual):
 
         self.insert1(key, skip_duplicates=True)
 
-# NOTE IntervalList used to work for HexMazeBlock and HexMazeBlock.Trial, now does not and idk why.
-# Replaced with blob for now??
 
 @schema
 class HexMazeBlock(SpyglassMixin, dj.Manual):
@@ -112,7 +110,8 @@ class HexMazeBlock(SpyglassMixin, dj.Manual):
     populates the Trial part table and HexMazeConfig table.
 
     HexMazeBlock inherits primary keys nwb_file_name and epoch from TaskEpoch, 
-    and inherits secondary key config_id from HexMazeConfig
+    and inherits secondary keys config_id from HexMazeConfig 
+    and interval_list_name from IntervalList
     """
 
     definition = """
@@ -120,11 +119,11 @@ class HexMazeBlock(SpyglassMixin, dj.Manual):
     block: int                      # the block number within the epoch
     ---
     -> HexMazeConfig                # gives config_id
+    -> IntervalList                 # [start_time, end_time] defining block bounds
     p_a: float                      # probability of reward at port A
     p_b: float                      # probability of reward at port B
     p_c: float                      # probability of reward at port C
     num_trials: int                 # number of trials in this block
-    block_interval: blob            # [start_time, end_time] defining block bounds
     task_type: varchar(64)          # 'barrier shift' or 'probabilty shift'
     """
 
@@ -141,12 +140,12 @@ class HexMazeBlock(SpyglassMixin, dj.Manual):
         -> master                       # gives nwb_file_name, epoch, block
         block_trial_num: int            # trial number within the block
         ---
+        -> IntervalList                 # [start_time, end_time] defining trial bounds
         epoch_trial_num: int            # trial number within the epoch
         reward: bool                    # if the rat got a reward
         start_port: varchar(5)          # A, B, or C
         end_port: varchar(5)            # A, B, or C
         opto_cond=NULL: varchar(64)     # description of opto condition, if any (delay / no_delay)
-        trial_interval: blob            # [start_time, end_time] defining trial bounds
         poke_interval: blob             # np.array of [poke_in, poke_out]
         duration: float                 # trial duration in seconds
         """
@@ -167,10 +166,11 @@ class HexMazeBlock(SpyglassMixin, dj.Manual):
                 HexMazeConfig().insert_config({"config_id": block.maze_configuration})
 
                 # Add the block interval to the IntervalList table
+                block_interval_list_name = f"epoch{block.epoch}_block{block.block}"
                 IntervalList.insert1(
                     {
                         "nwb_file_name": nwb_file_name,
-                        "interval_list_name": f"epoch{block.epoch}_block{block.block}",
+                        "interval_list_name": block_interval_list_name,
                         "valid_times": np.array([block.start_time, block.stop_time]),
                         "pipeline": "hex_maze"
                     }, skip_duplicates=True
@@ -182,11 +182,11 @@ class HexMazeBlock(SpyglassMixin, dj.Manual):
                     'epoch': block.epoch,
                     'block': block.block,
                     'config_id': block.maze_configuration,
+                    'interval_list_name': block_interval_list_name,
                     'p_a': block.pA,
                     'p_b': block.pB,
                     'p_c': block.pC,
                     'num_trials': block.num_trials,
-                    'block_interval': f"epoch{block.epoch}_block{block.block}",
                     'task_type': block.task_type
                 }
                 self.insert1(block_key, skip_duplicates=True)
@@ -196,10 +196,11 @@ class HexMazeBlock(SpyglassMixin, dj.Manual):
             for trial in trial_data.itertuples():
 
                 # Insert the trial interval into the IntervalList table
+                trial_interval_list_name = f"epoch{trial.epoch}_block{trial.block}_trial{trial.trial_within_block}"
                 IntervalList.insert1(
                     {
                         "nwb_file_name": nwb_file_name,
-                        "interval_list_name": f"epoch{trial.epoch}_block{trial.block}_trial{trial.trial_within_block}",
+                        "interval_list_name": trial_interval_list_name,
                         "valid_times": np.array([trial.start_time, trial.stop_time]),
                         "pipeline": "hex_maze"
                     }, skip_duplicates=True
@@ -212,11 +213,11 @@ class HexMazeBlock(SpyglassMixin, dj.Manual):
                     'block': trial.block,
                     'block_trial_num': trial.trial_within_block,
                     'epoch_trial_num': trial.trial_within_epoch,
+                    'interval_list_name': trial_interval_list_name,
                     'reward': trial.reward,
                     'start_port': trial.start_port,
                     'end_port': trial.end_port,
                     'opto_cond': trial.opto_condition,
-                    'trial_interval': f"epoch{trial.epoch}_block{trial.block}_trial{trial.trial_within_block}",
                     'poke_interval': np.array([trial.poke_in, trial.poke_out]),
                     'duration': trial.duration
                 }
