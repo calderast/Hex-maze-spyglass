@@ -272,8 +272,6 @@ class HexCentroids(dj.Imported):
     -> Session  
     ---
     """
-    
-    # TODO: helpers to return centroids without side hexes too
 
     @classmethod
     def get_hex_centroids_dict_cm(cls, session_key):
@@ -290,6 +288,29 @@ class HexCentroids(dj.Imported):
         """
         hexes, x_pixels, y_pixels = (cls.HexCentroidsPart & session_key).fetch('hex', 'x_pixels', 'y_pixels')
         return {hex_id: (x, y) for hex_id, x, y in zip(hexes, x_pixels, y_pixels)}
+
+    @classmethod
+    def get_core_hex_centroids_dict_cm(cls, session_key):
+        """
+        Helper to return a dictionary mapping each hex ID to its (x_cm, y_cm) tuple.
+        Includes core hexes only (side hexes by reward ports are removed)
+        """
+        centroids_dict = cls.get_hex_centroids_dict_cm(session_key)
+        # Remove side hex centroids and cast strings to ints
+        centroids_dict = {int(k): v for k, v in centroids_dict.items() if "_left" not in k and "_right" not in k}
+        return centroids_dict
+
+    @classmethod
+    def get_core_hex_centroids_dict_pixels(cls, session_key):
+        """
+        Helper to return a dictionary mapping each hex ID to its (x_pixels, y_pixels) tuple.
+        Includes core hexes only (side hexes by reward ports are removed)
+        """
+        centroids_dict = cls.get_hex_centroids_dict_pixels(session_key)
+        # Remove side hex centroids and cast strings to ints
+        centroids_dict = {int(k): v for k, v in centroids_dict.items() if "_left" not in k and "_right" not in k}
+        return centroids_dict
+
 
     class HexCentroidsPart(dj.Part):
         definition ="""
@@ -496,7 +517,7 @@ class HexPosition(SpyglassMixin, dj.Computed):
                         {'nwb_file_name': key['nwb_file_name'], 
                         'interval_list_name': block['interval_list_name']}
                         ).fetch1('valid_times')[0]
-            
+
             # Filter position_df to only include times for this block
             block_mask = (position_df.index >= block_start) & (position_df.index <= block_end)
             block_positions = position_df.loc[block_mask]
@@ -551,13 +572,10 @@ class HexPosition(SpyglassMixin, dj.Computed):
         self.insert1(key)
 
     def fetch1_dataframe(self):
-        return self.fetch_nwb()[0]["hex_assignment"]
+        return self.fetch_nwb()[0]["hex_assignment"].set_index('time')
 
 
-### ANYTHING BELOW HERE IS MY ROUGH NOTES
-
-
-#@schema
+# @schema
 # class HexMazeTraversal(dj.Manual):
 #     """
 #     Stores each hex transition within a trial, including entry/exit times,
@@ -585,34 +603,34 @@ class HexPosition(SpyglassMixin, dj.Computed):
 #     # inverse maybe?
 #     """
     
-    # TODO: how to classify hexes not on optimal path from from to to
+#     # TODO: how to classify hexes not on optimal path from from to to
 
-    # # add hex or maybe make this add hexes from trial
-    # def add_trial(self, trial_info: HexMazeBlock.Trial):
-    #     # Fetch trial info
-    #     trial_info = (HexMazeBlock.Trial & key).fetch1() # only needed if we pass key vs the object - havent decided yet
-    #     config_id = (HexMazeBlock & key).fetch1('config_id')
+#     # add hex or maybe make this add hexes from trial
+#     def add_trial(self, trial_info: HexMazeBlock.Trial):
+#         # Fetch trial info
+#         trial_info = (HexMazeBlock.Trial & key).fetch1() # only needed if we pass key vs the object - havent decided yet
+#         config_id = (HexMazeBlock & key).fetch1('config_id')
 
-    #     start_port = trial_info['start_port']
-    #     end_port = trial_info['end_port']
+#         start_port = trial_info['start_port']
+#         end_port = trial_info['end_port']
         
-    #     # Loop though hex assignment for this trial
-    #     # compute the secondary keys
-    #     # self.insert1() with a dict of all keys and values
+#         # Loop though hex assignment for this trial
+#         # compute the secondary keys
+#         # self.insert1() with a dict of all keys and values
 
 
-    #     # Get the trial start and end times
-    #     trial_interval = (IntervalList & {
-    #         'nwb_file_name': key['nwb_file_name'],
-    #         'interval_list_name': trial_info['trial_interval']
-    #     }).fetch1('valid_times')
-    #     trial_start, trial_end = trial_interval
+#         # Get the trial start and end times
+#         trial_interval = (IntervalList & {
+#             'nwb_file_name': key['nwb_file_name'],
+#             'interval_list_name': trial_info['trial_interval']
+#         }).fetch1('valid_times')
+#         trial_start, trial_end = trial_interval
 
-    #     # Filter assigned hex data for the trial time interval
-    #     hex_positions_for_this_trial = hex_assignment_df[(hex_assignment_df.index >= trial_start) 
-    #                                                      & (hex_assignment_df.index <= trial_end)]
+#         # Filter assigned hex data for the trial time interval
+#         hex_positions_for_this_trial = hex_assignment_df[(hex_assignment_df.index >= trial_start) 
+#                                                          & (hex_assignment_df.index <= trial_end)]
 
-    #     # Get hex ID column
+#         # Get hex ID column
     
 
     #     # Find transitions
