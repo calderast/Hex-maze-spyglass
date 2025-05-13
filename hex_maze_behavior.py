@@ -1,10 +1,11 @@
+import re
 import numpy as np
+import pandas as pd
 import datajoint as dj
 from pynwb import NWBHDF5IO
-from scipy.spatial import KDTree
 import spyglass.common as sgc
 from spyglass.common import Nwbfile, TaskEpoch, IntervalList, Session, AnalysisNwbfile
-from spyglass.position import  PositionOutput
+from spyglass.position import PositionOutput
 from spyglass.utils.dj_mixin import SpyglassMixin
 
 from hexmaze import get_maze_attributes
@@ -12,16 +13,73 @@ from hexmaze import get_maze_attributes
 schema = dj.schema("hex_maze")
 
 def populate_all_hexmaze(nwb_file_name):
-    """Insert all hex maze related tables for a given NWB file"""
-    
+    """Insert basic hex maze related tables for a given NWB file"""
+
     # Populate the HexMazeBlock table, Trial part table, and HexMazeConfig table
     HexMazeBlock().load_from_nwb(nwb_file_name)
     # Populate the HexCentroids table
     HexCentroids.populate({'nwb_file_name': nwb_file_name})
 
-    # TODO: Assign position to hex
+    # TODO: Hex trajectory for each trial?
 
-    # TODO: Hex trajectory for each trial
+
+def populate_all_hex_position():
+    """
+    Find all valid HexPositionSelection keys, insert them into 
+    the HexPositionSelection table, and populate HexPosition.
+    """
+
+    # Get all valid keys that can be used to populate the HexPositionSelection table
+    all_valid_keys = HexPositionSelection.get_all_valid_keys()
+
+    # Insert each key into HexPositionSelection with renamed key field
+    for key in all_valid_keys:
+        selection_key = key.copy()
+        selection_key["pos_merge_id"] = selection_key.pop("merge_id")
+
+        # Skip inserting the key if it already exists in the table
+        if selection_key in HexPositionSelection:
+            continue
+        try:
+            HexPositionSelection.insert1(selection_key, skip_duplicates=True)
+            print(f"Inserted new key {selection_key} into HexPositionSelection")
+        except Exception as e:
+            print(f"Skipping insert for {selection_key}: {e}")
+
+    # Populate HexPosition table
+    HexPosition.populate()
+
+
+def populate_hex_position(nwb_file_name):
+    """
+    Populate the HexPositionSelection and HexPosition tables for a given nwb_file_name.
+    """
+    # Get all valid keys for the that HexPositionSelection table for this nwb
+    all_valid_keys = HexPositionSelection.get_all_valid_keys(verbose=False)
+    nwb_file_keys = [key for key in all_valid_keys if key["nwb_file_name"] == nwb_file_name]
+
+    if not nwb_file_keys:
+        print(f"No valid HexPositionSelection keys found for {nwb_file_name}")
+        return
+
+    # Insert each key into HexPositionSelection with renamed key field
+    for key in nwb_file_keys:
+        selection_key = key.copy()
+        selection_key["pos_merge_id"] = selection_key.pop("merge_id")
+
+        # Skip inserting the key if it already exists in the table
+        if selection_key in HexPositionSelection:
+            continue
+        try:
+            HexPositionSelection.insert1(selection_key, skip_duplicates=True)
+            print(f"Inserted new key {selection_key} into HexPositionSelection")
+        except Exception as e:
+            print(f"Skipping insert for {selection_key}: {e}")
+
+    # Only populate HexPosition with keys for this nwb
+    selection_keys = (HexPositionSelection & {"nwb_file_name": nwb_file_name}).fetch("KEY")
+    print(f"Populating HexPosition for {len(selection_keys)} entries in {nwb_file_name}")
+    HexPosition.populate(selection_keys)
 
 
 @schema
@@ -84,7 +142,8 @@ class HexMazeBlock(SpyglassMixin, dj.Manual):
     populates the Trial part table and HexMazeConfig table.
 
     HexMazeBlock inherits primary keys nwb_file_name and epoch from TaskEpoch, 
-    and inherits secondary key config_id from HexMazeConfig
+    and inherits secondary keys config_id from HexMazeConfig 
+    and interval_list_name from IntervalList
     """
 
     definition = """
@@ -92,11 +151,11 @@ class HexMazeBlock(SpyglassMixin, dj.Manual):
     block: int                      # the block number within the epoch
     ---
     -> HexMazeConfig                # gives config_id
+    -> IntervalList                 # [start_time, end_time] defining block bounds
     p_a: float                      # probability of reward at port A
     p_b: float                      # probability of reward at port B
     p_c: float                      # probability of reward at port C
     num_trials: int                 # number of trials in this block
-    block_interval: IntervalList    # [start_time, end_time] defining block bounds
     task_type: varchar(64)          # 'barrier shift' or 'probabilty shift'
     """
 
@@ -113,12 +172,12 @@ class HexMazeBlock(SpyglassMixin, dj.Manual):
         -> master                       # gives nwb_file_name, epoch, block
         block_trial_num: int            # trial number within the block
         ---
+        -> IntervalList                 # [start_time, end_time] defining trial bounds
         epoch_trial_num: int            # trial number within the epoch
         reward: bool                    # if the rat got a reward
         start_port: varchar(5)          # A, B, or C
         end_port: varchar(5)            # A, B, or C
         opto_cond=NULL: varchar(64)     # description of opto condition, if any (delay / no_delay)
-        trial_interval: IntervalList    # [start_time, end_time] defining trial bounds
         poke_interval: blob             # np.array of [poke_in, poke_out]
         duration: float                 # trial duration in seconds
         """
@@ -139,11 +198,12 @@ class HexMazeBlock(SpyglassMixin, dj.Manual):
                 HexMazeConfig().insert_config({"config_id": block.maze_configuration})
 
                 # Add the block interval to the IntervalList table
+                block_interval_list_name = f"epoch{block.epoch}_block{block.block}"
                 IntervalList.insert1(
                     {
                         "nwb_file_name": nwb_file_name,
-                        "interval_list_name": f"epoch{block.epoch}_block{block.block}",
-                        "valid_times": np.array([block.start_time, block.stop_time]),
+                        "interval_list_name": block_interval_list_name,
+                        "valid_times": np.array([[block.start_time, block.stop_time]]),
                         "pipeline": "hex_maze"
                     }, skip_duplicates=True
                 )
@@ -154,11 +214,11 @@ class HexMazeBlock(SpyglassMixin, dj.Manual):
                     'epoch': block.epoch,
                     'block': block.block,
                     'config_id': block.maze_configuration,
+                    'interval_list_name': block_interval_list_name,
                     'p_a': block.pA,
                     'p_b': block.pB,
                     'p_c': block.pC,
                     'num_trials': block.num_trials,
-                    'block_interval': f"epoch{block.epoch}_block{block.block}",
                     'task_type': block.task_type
                 }
                 self.insert1(block_key, skip_duplicates=True)
@@ -168,11 +228,12 @@ class HexMazeBlock(SpyglassMixin, dj.Manual):
             for trial in trial_data.itertuples():
 
                 # Insert the trial interval into the IntervalList table
+                trial_interval_list_name = f"epoch{trial.epoch}_block{trial.block}_trial{trial.trial_within_block}"
                 IntervalList.insert1(
                     {
                         "nwb_file_name": nwb_file_name,
-                        "interval_list_name": f"epoch{trial.epoch}_block{trial.block}_trial{trial.trial_within_block}",
-                        "valid_times": np.array([trial.start_time, trial.stop_time]),
+                        "interval_list_name": trial_interval_list_name,
+                        "valid_times": np.array([[trial.start_time, trial.stop_time]]),
                         "pipeline": "hex_maze"
                     }, skip_duplicates=True
                 )
@@ -184,11 +245,11 @@ class HexMazeBlock(SpyglassMixin, dj.Manual):
                     'block': trial.block,
                     'block_trial_num': trial.trial_within_block,
                     'epoch_trial_num': trial.trial_within_epoch,
+                    'interval_list_name': trial_interval_list_name,
                     'reward': trial.reward,
                     'start_port': trial.start_port,
                     'end_port': trial.end_port,
                     'opto_cond': trial.opto_condition,
-                    'trial_interval': f"epoch{trial.epoch}_block{trial.block}_trial{trial.trial_within_block}",
                     'poke_interval': np.array([trial.poke_in, trial.poke_out]),
                     'duration': trial.duration
                 }
@@ -200,19 +261,46 @@ class HexMazeBlock(SpyglassMixin, dj.Manual):
 @schema
 class HexCentroids(dj.Imported):
     """
-    Contains hex centroids for each session for the hex maze task in video pixel coordinates
-    Used for assigning x, y position to a hex
+    Contains a table of hex centroids for each session in the hex maze task
+    in video pixel coordinates and cm. The pixels to cm conversion is determined
+    from a spatial series for this session in the RawPosition table.
+    The session must exist in the HexMazeBlock table (populated via populate_all_hexmaze) 
+    and the RawPosition table (populated via sgc.insert_session).
     """
 
     definition = """
-    -> Session           
-    hex: varchar(10)    # the hex ID in the hex maze (1-49)
+    -> Session  
     ---
-    x_pixels: float     # the x coordinate of the hex centroid, in video pixel coordinates
-    y_pixels: float     # the y coordinate of the hex centroid, in video pixel coordinates
-    x_cm: float         # the x coordinate of the hex centroid, in cm
-    y_cm: float         # the y coordinate of the hex centroid, in cm
     """
+    
+    # TODO: helpers to return centroids without side hexes too
+
+    @classmethod
+    def get_hex_centroids_dict_cm(cls, session_key):
+        """
+        Helper to return a dictionary mapping each hex ID to its (x_cm, y_cm) tuple.
+        """
+        hexes, x_cm, y_cm = (cls.HexCentroidsPart & session_key).fetch('hex', 'x_cm', 'y_cm')
+        return {hex_id: (x, y) for hex_id, x, y in zip(hexes, x_cm, y_cm)}
+
+    @classmethod
+    def get_hex_centroids_dict_pixels(cls, session_key):
+        """
+        Helper to return a dictionary mapping each hex ID to its (x_pixels, y_pixels) tuple.
+        """
+        hexes, x_pixels, y_pixels = (cls.HexCentroidsPart & session_key).fetch('hex', 'x_pixels', 'y_pixels')
+        return {hex_id: (x, y) for hex_id, x, y in zip(hexes, x_pixels, y_pixels)}
+
+    class HexCentroidsPart(dj.Part):
+        definition ="""
+        -> master
+        hex: varchar(10)    # the hex ID in the hex maze (1-49)
+        ---
+        x_pixels: float     # the x coordinate of the hex centroid, in video pixel coordinates
+        y_pixels: float     # the y coordinate of the hex centroid, in video pixel coordinates
+        x_cm: float         # the x coordinate of the hex centroid, in cm
+        y_cm: float         # the y coordinate of the hex centroid, in cm
+        """     
 
     @staticmethod
     def get_side_hex_centroids(hex_centroids):
@@ -257,17 +345,16 @@ class HexCentroids(dj.Imported):
             centroids_df = behavior_module.data_interfaces["hex_centroids"].to_dataframe()
             centroids_dict = centroids_df.set_index('hex')[['x', 'y']].apply(tuple, axis=1).to_dict()
 
-        # TODO: We ignore nwb x_meters and y_meters if exists and get the conversion from the spatial series
-        # Do we like this? It feels messy
-
         # Get the number of the first run epoch from the HexMazeBlock table
         first_run_epoch = (HexMazeBlock() & {"nwb_file_name": key["nwb_file_name"]}).fetch('epoch')[0]
         interval_list_name = f"pos {first_run_epoch} valid times"
 
         # Get the raw position data for the first run epoch
         raw_position = (sgc.RawPosition.PosObject 
-                        & {"nwb_file_name": key["nwb_file_name"], 'interval_list_name':interval_list_name})
+                        & {"nwb_file_name": key["nwb_file_name"], 'interval_list_name': interval_list_name})
         spatial_series = raw_position.fetch_nwb()[0]["raw_position"]
+
+        # TODO descriptive error if these don't exist
 
         # Use the conversion factor from this spatial series (same for all run epochs in a session)
         conversion_factor = spatial_series.conversion  # {unit} per pixel
@@ -289,11 +376,10 @@ class HexCentroids(dj.Imported):
             'y_pixels': row.y,
             'x_cm': row.x*cm_per_pixel,
             'y_cm': row.y*cm_per_pixel,
-            # TODO: add a column for hex size based on distance to nearest neighbor
+            # TODO: add a column for hex size based on distance to nearest neighbor?
         }
         for row in centroids_df.itertuples()
         ]
-        self.insert(centroids_to_insert, skip_duplicates=True)
 
         # Insert the calculated centroids of the side half-hexes by reward ports
         side_hex_centroids = HexCentroids.get_side_hex_centroids(centroids_dict)
@@ -308,125 +394,168 @@ class HexCentroids(dj.Imported):
         }
         for side_hex in side_hex_centroids
         ]
-        self.insert(side_hex_centroids_to_insert, skip_duplicates=True)
+
+        # Insert nwb_file_name into the HexCentroids table
+        self.insert1(key) 
+        # Insert the hex centroids into the HexCentroidsPart part table
+        self.HexCentroidsPart.insert(centroids_to_insert, skip_duplicates=True)
+        self.HexCentroidsPart.insert(side_hex_centroids_to_insert, skip_duplicates=True)
 
 
+@schema
+class HexPositionSelection(SpyglassMixin, dj.Manual):
+    """
+    Note we inherit from TaskEpoch instead of HexMazeBlock because we want
+    nwb_file_name and epoch (but not block) as primary keys.
+    The session must exist in the HexMazeBlock table (populated via populate_all_hexmaze).
+    """
 
-#@schema
-#class HexPosition()
+    definition = """
+    -> PositionOutput.proj(pos_merge_id = "merge_id")
+    -> TaskEpoch
+    -> HexCentroids
+    ---
+    """
+
+    @classmethod
+    def get_all_valid_keys(cls, verbose=True):
+        """
+        Return a list of valid composite keys (nwb_file_name, epoch, merge_id) 
+        for sessions that have HexMazeBlock, PositionOutput, and HexCentroids data.
+        These keys can be used to populate the HexPositionSelection table.
+        
+        Use verbose=False to suppress print output.
+        """
+        all_valid_keys = []
+
+        # Loop through all unique nwbfiles in the HexMazeBlock table
+        for nwb_file_name in set(HexMazeBlock.fetch("nwb_file_name")):
+            key = {"nwb_file_name": nwb_file_name}
+
+            # Make sure an entry in HexCentroids exists for this nwbfile
+            if not len(HexCentroids & {"nwb_file_name": nwb_file_name}):
+                if verbose:
+                    print(f"No HexCentroids entry found for nwbfile {nwb_file_name}, skipping.")
+                continue
+
+            # Loop through all unique epochs
+            for epoch in set((HexMazeBlock & key).fetch("epoch")):
+                position_output_key = {
+                    "nwb_file_name": key["nwb_file_name"],
+                    "interval_list_name": f"pos {epoch} valid times"
+                }
+
+                # Fetch the merge_ids for this nwb + epoch combination (if it exists in the PositionOutput table)
+                try:
+                    merge_ids = (PositionOutput.merge_get_part(position_output_key)).fetch("KEY")
+                except ValueError as e:
+                    if verbose:
+                        print(f"No PositionOutput entry found for {position_output_key}, skipping.")
+                    continue
+
+                for merge_id in merge_ids:
+                    composite_key = {
+                        "nwb_file_name": nwb_file_name,
+                        "epoch": epoch,
+                        **merge_id
+                    }
+                    all_valid_keys.append(composite_key)
+        return all_valid_keys
 
 
 @schema
 class HexPosition(SpyglassMixin, dj.Computed):
     definition = """
-    -> PositionOutput
+    -> HexPositionSelection
     ---
     -> AnalysisNwbfile
     hex_assignment_object_id: varchar(128)
     """
 
     def make(self, key):
-        # Get the hex centroids for this nwb
-        centroids = (HexCentroids() & {"nwb_file_name": key["nwb_file_name"]})
+        # Get a dict of hex: (x, y) centroid in cm for this nwbfile
+        hex_centroids = HexCentroids.get_hex_centroids_dict_cm(key)
 
-        # Get all valid run epochs
-        run_epochs = (HexMazeBlock() & {"nwb_file_name": key["nwb_file_name"]}).fetch('epoch')
+        # Get the rat's position for this epoch from the PositionOutput table
+        pos_key = {"merge_id": key["pos_merge_id"]} # in case the key contains multiple 'merge_id'
+        position_df = (PositionOutput & pos_key).fetch1_dataframe()
 
-        for run_epoch in set(run_epochs):
-            # Get all position output tables for the nwbfile and the interval list for this eun epoch
-            # There will be multiple if it was processed with multiple sets of position parameters
-            interval_list_name = f"pos {run_epoch} valid times"
-            position_output_merge_tables = (
-                PositionOutput.merge_get_part({"nwb_file_name": key["nwb_file_name"], "interval_list_name": interval_list_name})
-            )
+        # Set up a new df to store assigned hex info for each index in position_df
+        # (We use -1 and "None" instead of nan to avoid HDF5 datatype issues)
+        hex_df = pd.DataFrame({
+            "hex": np.full(len(position_df), -1),
+            "hex_including_sides": ["None"] * len(position_df),
+            "distance_from_centroid": np.full(len(position_df), -1.0)
+        }, index=position_df.index)
+    
+        # Loop through all blocks within this epoch
+        for block in (HexMazeBlock & {"nwb_file_name": key["nwb_file_name"], "epoch": key["epoch"]}):
 
-            # Get position data for each position output table
-            merge_ids = position_output_merge_tables.fetch("KEY")
-            for merge_id in merge_ids: 
-                # Use this merge id to restrict the PositionOutput table and fetch the position data
-                position_info = (PositionOutput & merge_id).fetch1_dataframe()
+            # Get the block start and end times
+            block_start, block_end = (IntervalList & 
+                        {'nwb_file_name': key['nwb_file_name'], 
+                        'interval_list_name': block['interval_list_name']}
+                        ).fetch1('valid_times')[0]
+            
+            # Filter position_df to only include times for this block
+            block_mask = (position_df.index >= block_start) & (position_df.index <= block_end)
+            block_positions = position_df.loc[block_mask]
 
-            # TODO: We probably want to iterate by blocks instead. 
-            # For each block, get the maze config and get what epoch it is in. 
-            # Use the epoch to create the interval list name.
-            # Use the maze config to create a dict of hex centroids including only open hexes.
-            # Use the block boundaries of the interval list to filter position for this block.
-            # Assign positions in this block to the nearest hex centroid.
-            # Get 2 columns: collapsed into 49 hexes only, or including side hexes as distinct.
-            # Create a dataframe the same length as position_info with the hex assignment data.
-            # Save it in an analysisnwb??
+            # Get the hex maze config for this block
+            maze_config = block.get('config_id')
+            barrier_hexes = maze_config.split(',')
+
+            # Remove the barrier hexes from our centroids dict
+            for hex_id in barrier_hexes:
+                hex_centroids.pop(hex_id, None)
+
+            # Convert hex_centroids to array for fast computation
+            hex_ids = list(hex_centroids.keys())
+            hex_coords = np.array(list(hex_centroids.values()))  # shape (n_hexes, 2)
+
+            # Compute distances from each x, y position to each hex centroid
+            positions = block_positions[['position_x', 'position_y']].to_numpy()  # shape (n_positions, 2)
+            diffs = positions[:, np.newaxis, :] - hex_coords[np.newaxis, :, :]  # shape (n_positions, n_hexes, 2)
+            dists = np.linalg.norm(diffs, axis=2)  # shape (n_positions, n_hexes)
+
+            # Find the closest hex centroid for each x, y position
+            closest_idx = np.argmin(dists, axis=1)
+            closest_hex_incl_sides = [hex_ids[i] for i in closest_idx]
+
+            # Calculate the distance from the centroid for each closest hex
+            distance_from_centroid = np.min(dists, axis=1)
+
+            # Closest_hex_incl_sides includes ids for the 6 side hexes next to the reward ports (e.g '4_left')
+            # Closest_core_hex assigns the side hexes to their "core" hex (e.g. '4_left' and '4_right') become 4
+            closest_core_hex = [int(re.match(r"\d+", hex_id).group()) for hex_id in closest_hex_incl_sides]
+
+            # Add info for this block to hex_df
+            hex_df.loc[block_positions.index, "hex"] = closest_core_hex
+            hex_df.loc[block_positions.index, "hex_including_sides"] = closest_hex_incl_sides
+            hex_df.loc[block_positions.index, "distance_from_centroid"] = distance_from_centroid
+
+        # Save time as a column instead so we don't have float indices
+        hex_df["time"] = hex_df.index
+        hex_df = hex_df.reset_index(drop=True)
+
+        # Create an empty AnalysisNwbfile with a link to the original nwb
+        analysis_file_name = AnalysisNwbfile().create(key["nwb_file_name"])
+        # Store the name of this newly created AnalysisNwbfile 
+        key["analysis_file_name"] = analysis_file_name
+        # Add the computed hex dataframe to the AnalysisNwbfile 
+        key["hex_assignment_object_id"] = AnalysisNwbfile().add_nwb_object(
+            analysis_file_name, hex_df, "hex_dataframe"
+        )
+        # Create an entry in the AnalysisNwbfile table (like insert1)
+        AnalysisNwbfile().add(key["nwb_file_name"], key["analysis_file_name"])
+        self.insert1(key)
+
+    def fetch1_dataframe(self):
+        return self.fetch_nwb()[0]["hex_assignment"]
 
 
 ### ANYTHING BELOW HERE IS MY ROUGH NOTES
 
-# Template from Sam's code for analysisnwb??:
-    # df = pd.DataFrame({"time": results.time, "decode_distance": distance})
-
-    #     analysis_file_name = AnalysisNwbfile().create(key["nwb_file_name"])
-    #     key["analysis_file_name"] = analysis_file_name
-    #     key["distance_object_id"] = AnalysisNwbfile().add_nwb_object(
-    #         analysis_file_name, df, "distance"
-    #     )
-    #     AnalysisNwbfile().add(key["nwb_file_name"], key["analysis_file_name"])
-    #     self.insert1(key)
-    
-#         # set up analysisnwb using this style (copied from Sam's for now)
-#         df = pd.DataFrame({"time": results.time, "hex": distance, "hex_with_sides"})
-
-#         # Create an empty AnalysisNwbfile with a link to the original nwb
-#         analysis_file_name = AnalysisNwbfile().create(key["nwb_file_name"])
-#         # Store the name of this newly created AnalysisNwbfile 
-#         key["analysis_file_name"] = analysis_file_name
-#         # Add the computed hex dataframe to the AnalysisNwbfile 
-#         key["hex_assignment_object_id"] = AnalysisNwbfile().add_nwb_object(
-#             analysis_file_name, df, "hex_assignment"
-#         )
-#         # ? was this not done in the first line - ask Sam
-#         AnalysisNwbfile().add(key["nwb_file_name"], key["analysis_file_name"])
-
-#         self.insert1(key)
-        
-
-#     def return_closest_hex(self, session_key, x, y):
-#         # Fetch the hex centroids for the given session
-#         centroids = (self & session_key).fetch(order_by='hex')
-#         centroids = (HexCentroids() & 'nwb_file_name'))
-#         display(centroids)
-#         hex_ids = np.array([entry['hex'] for entry in centroids])
-#         positions = np.array([[entry['x_cm'], entry['y_cm']] for entry in centroids])
-
-#         # Use KDTree to find the closest hex
-#         tree = KDTree(positions)
-#         _, idx = tree.query([x, y])
-    
-#         # Collapse side hexes into hex closest to port
-#         # (matches the first integer in the string and returns it)
-#         hex_number = int(re.match(r"\d+", hex_ids[idx]).group()) 
-
-#         # Return the hex ID corresponding to the closest position
-#         return hex_number
-    
-    
-#     def return_closest_hex_including_sides(self, session_key, x, y):
-#         # Fetch the hex centroids for the given session
-#         centroids = (self & session_key).fetch(order_by='hex')
-#         hex_ids = np.array([entry['hex'] for entry in centroids])
-#         positions = np.array([[entry['x_cm'], entry['y_cm']] for entry in centroids])
-
-#         # Use KDTree to find the closest hex
-#         tree = KDTree(positions)
-#         _, idx = tree.query([x, y])
-        
-#         # Return the hex ID corresponding to the closest position
-#         return int(hex_ids[idx])
-    
-
-
-
-    # def fetch1_dataframe(self) -> pd.DataFrame:
-    #     if not len(nwb := self.fetch_nwb()):
-    #         raise ValueError("fetch1_dataframe must be called on a single key")
-    #     return nwb[0].set_index("time") # how to fetch dataframe here?
 
 #@schema
 # class HexMazeTraversal(dj.Manual):
@@ -484,19 +613,7 @@ class HexPosition(SpyglassMixin, dj.Computed):
     #                                                      & (hex_assignment_df.index <= trial_end)]
 
     #     # Get hex ID column
-        
-    #     # # Get centroids
-    #     # centroids = (HexCentroids & {'nwb_file_name': key['nwb_file_name']}).fetch(as_dict=True)
-    #     # centroid_dict = {entry['hex']: np.array([entry['x'], entry['y']]) for entry in centroids}
-        
-    #     # # Assign each position to a hex using HexCentroids method return_closest_hex
-    #     # assigned_hexes = []
-    #     # for _, pos in trial_positions[['x', 'y']].iterrows():
-    #     #     hex_id = HexCentroids().return_closest_hex(
-    #     #         session_key={'nwb_file_name': key['nwb_file_name'], 'config_id': config_id},
-    #     #         x=pos['x'], y=pos['y']
-    #     #     )
-    #     #     assigned_hexes.append(hex_id)
+    
 
     #     # Find transitions
     #     entries = []
