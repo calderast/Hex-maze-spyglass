@@ -13,14 +13,12 @@ from hexmaze import get_maze_attributes
 schema = dj.schema("hex_maze")
 
 def populate_all_hexmaze(nwb_file_name):
-    """Insert basic hex maze related tables for a given NWB file"""
+    """Populate basic hex maze tables (HexMazeBlock, HexMazeBlock.Trial, HexCentroids) for a given NWB file"""
 
     # Populate the HexMazeBlock table, Trial part table, and HexMazeConfig table
     HexMazeBlock().load_from_nwb(nwb_file_name)
     # Populate the HexCentroids table
     HexCentroids.populate({'nwb_file_name': nwb_file_name})
-
-    # TODO: Hex trajectory for each trial?
 
 
 def populate_all_hex_position():
