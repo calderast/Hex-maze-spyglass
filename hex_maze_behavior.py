@@ -570,6 +570,7 @@ class HexPosition(SpyglassMixin, dj.Computed):
         self.insert1(key)
 
     def fetch1_dataframe(self):
+        # Return the dataframe with time as the index
         return self.fetch_nwb()[0]["hex_assignment"].set_index('time')
 
 
@@ -631,40 +632,40 @@ class HexPosition(SpyglassMixin, dj.Computed):
 #         # Get hex ID column
     
 
-    #     # Find transitions
-    #     entries = []
-    #     prev_hex = None
-    #     for i in range(1, len(assigned_hexes)):
-    #         if assigned_hexes[i] != assigned_hexes[i - 1]:
-    #             exit_time = timestamps[i]
-    #             entry_time = timestamps[i - 1]
-    #             from_hex = assigned_hexes[i - 1]
-    #             to_hex = assigned_hexes[i]
+#         # Find transitions
+#         entries = []
+#         prev_hex = None
+#         for i in range(1, len(assigned_hexes)):
+#             if assigned_hexes[i] != assigned_hexes[i - 1]:
+#                 exit_time = timestamps[i]
+#                 entry_time = timestamps[i - 1]
+#                 from_hex = assigned_hexes[i - 1]
+#                 to_hex = assigned_hexes[i]
                 
-    #             # TODO: add a check for if the transition is valid.
-    #             # If not, hopefully the hex position has only jumped over 1 hex
-    #             # Assign a couple indices to the intermediate hex so we dont break things
+#                 # TODO: add a check for if the transition is valid.
+#                 # If not, hopefully the hex position has only jumped over 1 hex
+#                 # Assign a couple indices to the intermediate hex so we dont break things
 
-    #             hex_id = from_hex
-    #             hexes_from = calculate_hexes_from_port(hex_id, start_port, config_id)
-    #             hexes_to = calculate_hexes_to_port(hex_id, end_port, config_id)
+#                 hex_id = from_hex
+#                 hexes_from = calculate_hexes_from_port(hex_id, start_port, config_id)
+#                 hexes_to = calculate_hexes_to_port(hex_id, end_port, config_id)
 
-    #             entries.append({
-    #                 **key,
-    #                 'hex_index': len(entries),
-    #                 'hex': hex_id,
-    #                 'entry_time': entry_time,
-    #                 'exit_time': exit_time,
-    #                 'duration': exit_time - entry_time,
-    #                 'from_hex': prev_hex if prev_hex is not None else from_hex,
-    #                 'to_hex': to_hex,
-    #                 'hexes_from_port': hexes_from,
-    #                 'hexes_to_port': hexes_to,
-    #             })
+#                 entries.append({
+#                     **key,
+#                     'hex_index': len(entries),
+#                     'hex': hex_id,
+#                     'entry_time': entry_time,
+#                     'exit_time': exit_time,
+#                     'duration': exit_time - entry_time,
+#                     'from_hex': prev_hex if prev_hex is not None else from_hex,
+#                     'to_hex': to_hex,
+#                     'hexes_from_port': hexes_from,
+#                     'hexes_to_port': hexes_to,
+#                 })
 
-    #             prev_hex = from_hex
+#                 prev_hex = from_hex
 
-    #     self.insert(entries)
+#         self.insert(entries)
 
 
 

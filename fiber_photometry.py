@@ -326,21 +326,36 @@ class FiberPhotometrySeries(SpyglassMixin, dj.Manual):
         timestamps : numpy.ndarray
             The timestamps corresponding to each sample in the FiberPhotometryResponseSeries
         """
-        nwb_file_path = Nwbfile().get_abs_path(nwb_file_name)
+        # 2 potential options for this funtion, not sure which is preferred:
+    
+        # nwb_file_path = Nwbfile().get_abs_path(nwb_file_name)
 
-        try:
-            with NWBHDF5IO(nwb_file_path, "r", load_namespaces=True) as io:
-                nwbfile = io.read()
-                if series_name not in nwbfile.acquisition:
-                    raise ValueError(f"Series '{series_name}' not found in acquisition of '{nwb_file_name}'.")
+        # try:
+        #     with NWBHDF5IO(nwb_file_path, "r", load_namespaces=True) as io:
+        #         nwbfile = io.read()
+        #         if series_name not in nwbfile.acquisition:
+        #             raise ValueError(f"Series '{series_name}' not found in acquisition of '{nwb_file_name}'.")
 
-                series = nwbfile.acquisition[series_name]
-                if not isinstance(series, ndx_fiber_photometry.FiberPhotometryResponseSeries):
-                    raise TypeError(f"Series '{series_name}' is not a FiberPhotometryResponseSeries.")
+        #         series = nwbfile.acquisition[series_name]
+        #         if not isinstance(series, ndx_fiber_photometry.FiberPhotometryResponseSeries):
+        #             raise TypeError(f"Series '{series_name}' is not a FiberPhotometryResponseSeries.")
 
-                data = series.data[:]
-                timestamps = series.get_timestamps()
-                return data, timestamps
+        #         data = series.data[:]
+        #         timestamps = series.get_timestamps()
+        #         return data, timestamps
 
-        except FileNotFoundError:
-            raise FileNotFoundError(f"NWB file not found at path: {nwb_file_path}")
+        # except FileNotFoundError:
+        #     raise FileNotFoundError(f"NWB file not found at path: {nwb_file_path}")
+        
+        session_nwb = (Nwbfile() & {"nwb_file_name": nwb_file_name}).fetch_nwb()[0]
+
+        if series_name not in session_nwb.acquisition:
+            raise ValueError(f"Series '{series_name}' not found in acquisition of '{nwb_file_name}'.")
+
+        series = session_nwb.acquisition[series_name]
+        if not isinstance(series, ndx_fiber_photometry.FiberPhotometryResponseSeries):
+            raise TypeError(f"Series '{series_name}' is not a FiberPhotometryResponseSeries.")
+
+        data = series.data[:]
+        timestamps = series.get_timestamps()
+        return data, timestamps
