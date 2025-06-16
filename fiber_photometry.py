@@ -3,59 +3,49 @@ from pynwb import NWBHDF5IO
 from spyglass.common import Nwbfile, Session
 from spyglass.utils import SpyglassMixin, logger
 import ndx_fiber_photometry
-from ndx_fiber_photometry import FiberPhotometryResponseSeries, ExcitationSource, OpticalFiber, Photodetector
 
 schema = dj.schema("fiber_photometry")
 
-def get_photometry_series(nwbfile) -> list[FiberPhotometryResponseSeries]:
+def get_photometry_series(nwbfile) -> list[ndx_fiber_photometry.FiberPhotometryResponseSeries]:
     """Return all FiberPhotometryResponseSeries in the acquisition group of an NWB file."""
     return [
         obj for obj in nwbfile.acquisition.values()
         if isinstance(obj, ndx_fiber_photometry.FiberPhotometryResponseSeries)
     ]
 
-def get_excitation_sources(nwbfile) -> list[ExcitationSource]:
+def get_excitation_sources(nwbfile) -> list[ndx_fiber_photometry.ExcitationSource]:
     """Return all ExcitationSource devices in the NWB file."""
     return [
         obj for obj in nwbfile.devices.values()
         if isinstance(obj, ndx_fiber_photometry.ExcitationSource)
     ]
 
-def get_photodetectors(nwbfile) -> list[Photodetector]:
+def get_photodetectors(nwbfile) -> list[ndx_fiber_photometry.Photodetector]:
     """Return all Photodetector devices in the NWB file."""
     return [
         obj for obj in nwbfile.devices.values()
         if isinstance(obj, ndx_fiber_photometry.Photodetector)
     ]
 
-def get_optic_fibers(nwbfile) -> list[OpticalFiber]:
+def get_optic_fibers(nwbfile) -> list[ndx_fiber_photometry.OpticalFiber]:
     """Return all OpticalFiber devices in the NWB file."""
     return [
         obj for obj in nwbfile.devices.values()
         if isinstance(obj, ndx_fiber_photometry.OpticalFiber)
     ]
 
-def populate_all_photometry(nwb_file_name, config: dict = {}):
+def populate_all_fiber_photometry(nwb_file_name, config: dict = {}):
     nwb_file_path = Nwbfile().get_abs_path(nwb_file_name)
     with NWBHDF5IO(nwb_file_path, mode="r") as io:
         nwbfile = io.read()
 
         logger.info(f"Populating photometry device tables from {nwb_file_name}")
-        excitation_sources = ExcitationSource.insert_from_nwbfile(nwbfile, config=config.get("ExcitationSource"))
-        photodetectors = Photodetector.insert_from_nwbfile(nwbfile, config=config.get("Photodetector"))
-        optical_fibers = OpticalFiber.insert_from_nwbfile(nwbfile, config=config.get("OpticalFiber"))
+        ExcitationSource.insert_from_nwbfile(nwbf=nwbfile, config=config.get("ExcitationSource"))
+        Photodetector.insert_from_nwbfile(nwbf=nwbfile, config=config.get("Photodetector"))
+        OpticalFiber.insert_from_nwbfile(nwbf=nwbfile, config=config.get("OpticalFiber"))
 
-        # print("excitation")
-        # print(excitation_sources)
-        # print("photodetector")
-        # print(photodetectors)
-        # print("optic fiber")
-        # print(optic_fibers)
-    
-        # Get actual photometry series
-        photometry_series = get_photometry_series(nwbfile)
-        print(f"photometry series")
-        print(photometry_series)
+        logger.info(f"Populating fiber photometry series from {nwb_file_name}")
+        FiberPhotometrySeries.insert_from_nwbfile(nwbf=nwbfile, nwb_file_name=nwb_file_name)
 
 
 @schema
@@ -268,23 +258,29 @@ class FiberPhotometrySeries(SpyglassMixin, dj.Manual):
     """
 
     @classmethod
-    def insert_from_nwbfile(cls, nwbf):
+    def insert_from_nwbfile(cls, nwbf, nwb_file_name: str):
         """Insert FiberPhotometryResponseSeries from an NWB file
 
         Parameters
         ----------
         nwbf : pynwb.NWBFile
             The source NWB file object.
+        nwb_file_name : str
+            The NWB file name, used to identify the session in the `Session` table.
 
         Returns
         -------
         photometry_series_list : list
             List of FiberPhotometryResponseSeries names found in the NWB file.
         """
+
+        session_key = {"nwb_file_name": nwb_file_name}
+
         photometry_series_list = list()
         for series in nwbf.acquisition.values():
             if isinstance(series, ndx_fiber_photometry.FiberPhotometryResponseSeries):
                 series_dict = {
+                    **session_key,
                     "photometry_series_name": series.name,
                     "description": series.description,
                     "unit": series.unit,
@@ -295,24 +291,56 @@ class FiberPhotometrySeries(SpyglassMixin, dj.Manual):
                 }
                 cls.insert1(series_dict, skip_duplicates=True)
                 photometry_series_list.append(series_dict["photometry_series_name"])
-                
-    # TODO: need nwb_file_name because using Session as primary key.
-    # It would be better practice to use TaskEpoch instead. but ndx-fiber-photometry doesn't support epochs?
-    # As a hack we could put this in series comments but I don't like that.
-    # Each series should also reference entries in excitationsource, opticalfiber, etc
+        if photometry_series_list:
+            logger.info(f"Inserted photometry series {photometry_series_list}")
+        else:
+            logger.warning("No conforming photometry series found.")
+        return photometry_series_list
+
+    # It would be better practice to use TaskEpoch instead of Session. 
+    # But ndx-fiber-photometry doesn't support identifying epochs.
+    # As a hack we could put the epoch in series comments but I don't love that.
+    # Each series should also reference entries in ExcitationSource, OpticalFiber, Photodetector, etc
     # Berke Lab nwbs should go back and properly implement virus info too so this can be properly linked
+    # Lots of TODOs there... I think I will table it for now so we can move forward. 
+    # But this will be annoying because it will require some level of re-conversion and reprocessing later on. 
+    # Sorry :(
 
     @classmethod
-    def fetch_series(cls, nwb_file_name: str, photometry_series_name: str):
+    def fetch_series(cls, nwb_file_name: str, series_name: str):
         """
         Fetch a FiberPhotometryResponseSeries object by nwbfile and series name.
+        
+        Parameters
+        ----------
+        nwb_file_name : str
+            The NWB file name
+        series_name : str
+            The name of the photometry series in the NWB file 
+            (same as the name stored in the FiberPhotometrySeries table)
+
+        Returns
+        -------
+        data : numpy.ndarray
+            The data for the FiberPhotometryResponseSeries found in the NWB file
+        timestamps : numpy.ndarray
+            The timestamps corresponding to each sample in the FiberPhotometryResponseSeries
         """
-        file_path = Nwbfile().get_abs_path(nwb_file_name)
-        with NWBHDF5IO(file_path, "r") as io:
-            nwbfile = io.read()
-            try:
-                series = nwbfile.acquisition[photometry_series_name]
-                if isinstance(series, ndx_fiber_photometry.FiberPhotometryResponseSeries):
-                    return series.data
-            except KeyError:
-                raise ValueError(f"FiberPhotometryResponseSeries '{photometry_series_name}' not found in {nwb_file_name}")
+        nwb_file_path = Nwbfile().get_abs_path(nwb_file_name)
+
+        try:
+            with NWBHDF5IO(nwb_file_path, "r", load_namespaces=True) as io:
+                nwbfile = io.read()
+                if series_name not in nwbfile.acquisition:
+                    raise ValueError(f"Series '{series_name}' not found in acquisition of '{nwb_file_name}'.")
+
+                series = nwbfile.acquisition[series_name]
+                if not isinstance(series, ndx_fiber_photometry.FiberPhotometryResponseSeries):
+                    raise TypeError(f"Series '{series_name}' is not a FiberPhotometryResponseSeries.")
+
+                data = series.data[:]
+                timestamps = series.get_timestamps()
+                return data, timestamps
+
+        except FileNotFoundError:
+            raise FileNotFoundError(f"NWB file not found at path: {nwb_file_path}")
