@@ -4,6 +4,7 @@ from pynwb import NWBHDF5IO
 from spyglass.common import Nwbfile, Session, IntervalList
 from spyglass.utils import SpyglassMixin, logger
 import ndx_fiber_photometry
+import re
 
 schema = dj.schema("fiber_photometry")
 
@@ -28,11 +29,25 @@ def get_photodetectors(nwbfile) -> list[ndx_fiber_photometry.Photodetector]:
         if isinstance(obj, ndx_fiber_photometry.Photodetector)
     ]
 
+def get_dichroic_mirrors(nwbfile) -> list[ndx_fiber_photometry.DichroicMirror]:
+    """Return all DichroicMirror devices in the NWB file."""
+    return [
+        obj for obj in nwbfile.devices.values()
+        if isinstance(obj, ndx_fiber_photometry.DichroicMirror)
+    ]
+
 def get_optic_fibers(nwbfile) -> list[ndx_fiber_photometry.OpticalFiber]:
     """Return all OpticalFiber devices in the NWB file."""
     return [
         obj for obj in nwbfile.devices.values()
         if isinstance(obj, ndx_fiber_photometry.OpticalFiber)
+    ]
+
+def get_indicators(nwbfile) -> list[ndx_fiber_photometry.Indicator]:
+    """Return all Indicator devices in the NWB file."""
+    return [
+        obj for obj in nwbfile.devices.values()
+        if isinstance(obj, ndx_fiber_photometry.Indicator)
     ]
 
 def populate_all_fiber_photometry(nwb_file_name, config: dict = {}):
@@ -44,6 +59,7 @@ def populate_all_fiber_photometry(nwb_file_name, config: dict = {}):
         ExcitationSource.insert_from_nwbfile(nwbf=nwbfile, config=config.get("ExcitationSource"))
         Photodetector.insert_from_nwbfile(nwbf=nwbfile, config=config.get("Photodetector"))
         OpticalFiber.insert_from_nwbfile(nwbf=nwbfile, config=config.get("OpticalFiber"))
+        Indicator.insert_from_nwbfile(nwbf=nwbfile, config=config.get("Indicator"))
 
         logger.info(f"Populating fiber photometry series from {nwb_file_name}")
         FiberPhotometrySeries.insert_from_nwbfile(nwbf=nwbfile, nwb_file_name=nwb_file_name)
@@ -174,6 +190,115 @@ class Photodetector(SpyglassMixin, dj.Manual):
         else:
             logger.warning("No conforming photodetector metadata found.")
         return device_name_list
+
+
+@schema
+class Indicator(SpyglassMixin, dj.Manual):
+    definition = """
+    construct_name: varchar(80)
+    ---
+    name: varchar(100)
+    description = "": varchar(1000)
+    """
+
+    @classmethod
+    def insert_from_nwbfile(cls, nwbf, config=None):
+        """Insert indicators from an NWB file.
+        NOTE: Ingestion expects the 'label' field to be the contstruct name 
+        (this is true for Berke Lab nwbs which are the only ones I care about at the moment)
+
+        Parameters
+        ----------
+        nwbf : pynwb.NWBFile
+            The source NWB file object.
+        config : dict
+            Dictionary read from a user-defined YAML file containing values to
+            replace in the NWB file.
+
+        Returns
+        -------
+        indicator_construct_name_list : list
+            List of indicator construct names found in the NWB file.
+            For Berke Lab, construct name is in the 'label' field, so this is effectively a list
+            of indicator labels.
+        """
+        config = config or dict()
+        device_name_list = list()
+        for device in nwbf.devices.values():
+            if isinstance(device, ndx_fiber_photometry.Indicator):
+                # Berke lab adds parenthesis to virus name for location (e.g. 'dLight3.8 (left NAcc)').
+                # Remove everything in parenthesis for the virus name
+                name = re.sub(r'\s+', ' ', re.sub(r'\([^)]*\)', '', device.name)).strip()
+                device_dict = {
+                    "construct_name": device.label,
+                    "name": name,
+                    "description": device.description,
+                }
+                cls.insert1(device_dict, skip_duplicates=True)
+                device_name_list.append(device_dict["construct_name"])
+        # Append devices from config file
+        # We still assume label holds the construct name, but do no cleaning of the "name" name
+        if device_list := config.get("Indicator"):
+            device_inserts = [
+                {
+                    "construct_name": device.get("label"),
+                    "name": device.get("name"),
+                    "description": device.get("description"),
+                }
+                for device in device_list
+            ]
+            cls.insert(device_inserts, skip_duplicates=True)
+            device_name_list.extend([d["construct_name"] for d in device_inserts])
+        if device_name_list:
+            logger.info(f"Inserted indicators {device_name_list}")
+        else:
+            logger.warning("No conforming indicator metadata found.")
+        return device_name_list
+
+# TODO: make an IndicatorInjection table.
+# If an indicator has the following optional fields, add it to a table
+# that maps the indicator to the location and coordinates.
+# Probably need to string-ify coords so it's hashable as a primary key
+    # injection_location: varchar(80)
+    # injection_coordinates_in_mm: float[]  # [ap_in_mm, ml_in_mm, dv_in_mm]
+
+# class IndicatorInjection(SpyglassMixin, dj.Manual):
+#     definition = """
+#     -> Indicator
+#     injection_location: varchar(80)
+#     injection_coordinates_id: varchar(32)  # Rounded coordinate string, e.g. '1.25_-0.75_-4.50'
+#     ---
+#     injection_coordinates_in_mm: float[]   # [AP, ML, DV] in mm
+#     """
+
+#     @staticmethod
+#     def make_coordinates_id(coords, precision=2):
+#         """Round and stringify coordinates for use as a primary key."""
+#         rounded = [round(c, precision) for c in coords]
+#         return "_".join(f"{v:.{precision}f}" for v in rounded)
+
+#     @classmethod
+#     def insert_from_indicator(cls, indicator):
+#         """
+#         Insert injection data from an ndx_fiber_photometry.Indicator object
+#         if it includes location and coordinate metadata.
+#         """
+#         if not (hasattr(indicator, "injection_location") and hasattr(indicator, "injection_coordinates_in_mm")):
+#             return
+
+#         location = indicator.injection_location
+#         coords = indicator.injection_coordinates_in_mm
+#         if location and coords:
+#             coord_id = cls.make_coordinates_id(coords)
+#             cls.insert1(
+#                 {
+#                     "construct_name": indicator.label,
+#                     "injection_location": location,
+#                     "injection_coordinates_id": coord_id,
+#                     "injection_coordinates_in_mm": coords,
+#                 },
+#                 skip_duplicates=True,
+#             )
 
 
 @schema
@@ -345,3 +470,31 @@ class FiberPhotometrySeries(SpyglassMixin, dj.Manual):
             raise TypeError(f"Series '{series_name}' is not a FiberPhotometryResponseSeries.")
 
         return series
+
+    
+    # @classmethod
+    # def fetch_all_series(cls, nwb_file_name: str):
+    #     """
+    #     Fetch all FiberPhotometryResponseSeries objects in a given nwbfile.
+        
+    #     Parameters
+    #     ----------
+    #     nwb_file_name : str
+    #         The NWB file name
+
+    #     Returns
+    #     -------
+    #     dict[str, ndx_fiber_photometry.FiberPhotometryResponseSeries]:
+    #         Dict of series name : FiberPhotometryResponseSeries found in the NWB file
+    #     """
+
+    #     session_nwb = (Nwbfile() & {"nwb_file_name": nwb_file_name}).fetch_nwb()[0]
+
+    #     if series_name not in session_nwb.acquisition:
+    #         raise ValueError(f"Series '{series_name}' not found in acquisition of '{nwb_file_name}'.")
+
+    #     series = session_nwb.acquisition[series_name]
+    #     if not isinstance(series, ndx_fiber_photometry.FiberPhotometryResponseSeries):
+    #         raise TypeError(f"Series '{series_name}' is not a FiberPhotometryResponseSeries.")
+
+    #     return series
