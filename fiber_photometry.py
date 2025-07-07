@@ -471,30 +471,24 @@ class FiberPhotometrySeries(SpyglassMixin, dj.Manual):
 
         return series
 
-    
-    # @classmethod
-    # def fetch_all_series(cls, nwb_file_name: str):
-    #     """
-    #     Fetch all FiberPhotometryResponseSeries objects in a given nwbfile.
-        
-    #     Parameters
-    #     ----------
-    #     nwb_file_name : str
-    #         The NWB file name
 
-    #     Returns
-    #     -------
-    #     dict[str, ndx_fiber_photometry.FiberPhotometryResponseSeries]:
-    #         Dict of series name : FiberPhotometryResponseSeries found in the NWB file
-    #     """
+    @classmethod
+    def fetch_all_series(cls, nwb_file_name: str) -> dict[str, ndx_fiber_photometry.FiberPhotometryResponseSeries]:
+        """
+        Fetch all FiberPhotometryResponseSeries objects in a given NWB file.
 
-    #     session_nwb = (Nwbfile() & {"nwb_file_name": nwb_file_name}).fetch_nwb()[0]
+        Parameters
+        ----------
+        nwb_file_name : str
+            The NWB file name.
 
-    #     if series_name not in session_nwb.acquisition:
-    #         raise ValueError(f"Series '{series_name}' not found in acquisition of '{nwb_file_name}'.")
+        Returns
+        -------
+        dict[str, ndx_fiber_photometry.FiberPhotometryResponseSeries]
+            Dict mapping series name to FiberPhotometryResponseSeries object.
+        """
+        session_nwb = (Nwbfile() & {"nwb_file_name": nwb_file_name}).fetch_nwb()[0]
 
-    #     series = session_nwb.acquisition[series_name]
-    #     if not isinstance(series, ndx_fiber_photometry.FiberPhotometryResponseSeries):
-    #         raise TypeError(f"Series '{series_name}' is not a FiberPhotometryResponseSeries.")
+        all_photometry_series = get_photometry_series(nwbfile=session_nwb)
 
-    #     return series
+        return {series.name: series for series in all_photometry_series}
