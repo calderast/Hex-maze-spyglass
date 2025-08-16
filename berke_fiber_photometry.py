@@ -6,7 +6,7 @@ from spyglass.utils import SpyglassMixin, logger
 import ndx_fiber_photometry
 import re
 
-schema = dj.schema("fiber_photometry")
+schema = dj.schema("berke_fiber_photometry")
 
 def get_photometry_series(nwbfile) -> list[ndx_fiber_photometry.FiberPhotometryResponseSeries]:
     """Return all FiberPhotometryResponseSeries in the acquisition group of an NWB file."""
@@ -204,7 +204,7 @@ class Indicator(SpyglassMixin, dj.Manual):
     @classmethod
     def insert_from_nwbfile(cls, nwbf, config=None):
         """Insert indicators from an NWB file.
-        NOTE: Ingestion expects the 'label' field to be the contstruct name 
+        NOTE: Ingestion expects the 'label' field to be the construct name 
         (this is true for Berke Lab nwbs which are the only ones I care about at the moment)
 
         Parameters
@@ -234,7 +234,11 @@ class Indicator(SpyglassMixin, dj.Manual):
                     "name": name,
                     "description": device.description,
                 }
+                # Insert into Indicator table
                 cls.insert1(device_dict, skip_duplicates=True)
+                # Try to insert into the IndicatorInjection table
+                IndicatorInjection.insert_from_indicator(device)
+                # Add to list of inserted indicators
                 device_name_list.append(device_dict["construct_name"])
         # Append devices from config file
         # We still assume label holds the construct name, but do no cleaning of the "name" name
@@ -247,7 +251,12 @@ class Indicator(SpyglassMixin, dj.Manual):
                 }
                 for device in device_list
             ]
+            # Insert into Indicator table
             cls.insert(device_inserts, skip_duplicates=True)
+            # Try to insert into the IndicatorInjection table
+            for device in device_list:
+                IndicatorInjection.insert_from_indicator(device)
+            # Add to list of inserted indicators
             device_name_list.extend([d["construct_name"] for d in device_inserts])
         if device_name_list:
             logger.info(f"Inserted indicators {device_name_list}")
@@ -255,50 +264,92 @@ class Indicator(SpyglassMixin, dj.Manual):
             logger.warning("No conforming indicator metadata found.")
         return device_name_list
 
-# TODO: make an IndicatorInjection table.
-# If an indicator has the following optional fields, add it to a table
-# that maps the indicator to the location and coordinates.
-# Probably need to string-ify coords so it's hashable as a primary key
-    # injection_location: varchar(80)
-    # injection_coordinates_in_mm: float[]  # [ap_in_mm, ml_in_mm, dv_in_mm]
 
-# class IndicatorInjection(SpyglassMixin, dj.Manual):
-#     definition = """
-#     -> Indicator
-#     injection_location: varchar(80)
-#     injection_coordinates_id: varchar(32)  # Rounded coordinate string, e.g. '1.25_-0.75_-4.50'
-#     ---
-#     injection_coordinates_in_mm: float[]   # [AP, ML, DV] in mm
-#     """
+@schema
+class IndicatorInjection(SpyglassMixin, dj.Manual):
+    """
+    Map an indicator to injection location, coordinates, volume, and titer (if we have that information). 
+    We use a rounded coordinates string as a primary key because float arrays are not hashable.
+    
+    Also note ndx_fiber_photometry Indicator objects do not have a standardized way to store 
+    titer or volume, so Berke Lab nwbs include them in the indicator description as follows:
+    
+    description=(
+        f"{indicator_metadata['description']}. "
+        f"Titer in vg/mL: {virus_injection.get('titer_in_vg_per_mL', 'unknown')}. "
+        f"Volume in uL: {virus_injection.get('volume_in_uL', 'unknown')}."
+    )
+    
+    Our parsing assumes this description format, and substitutes 'unknown' 
+    for volume and titer if no values are found. Idk if I like this yet.
+    """
 
-#     @staticmethod
-#     def make_coordinates_id(coords, precision=2):
-#         """Round and stringify coordinates for use as a primary key."""
-#         rounded = [round(c, precision) for c in coords]
-#         return "_".join(f"{v:.{precision}f}" for v in rounded)
+    definition = """
+    -> Indicator
+    injection_coords: varchar(32)   # Rounded coordinates string, e.g. '1.7,1.7,-6.0'
+    titer_in_vg_per_ml: varchar(10)
+    volume_in_ul: varchar(10)
+    ---
+    injection_location: varchar(80)
+    injection_coords_in_mm: blob       # [AP, ML, DV] in mm
+    """
 
-#     @classmethod
-#     def insert_from_indicator(cls, indicator):
-#         """
-#         Insert injection data from an ndx_fiber_photometry.Indicator object
-#         if it includes location and coordinate metadata.
-#         """
-#         if not (hasattr(indicator, "injection_location") and hasattr(indicator, "injection_coordinates_in_mm")):
-#             return
+    @staticmethod
+    def _parse_titer_volume(description_str):
+        """
+        Extract description, titer, and volume from a description string.
+        For now we don't use the cleaned description.
+        Case-insensitive. Missing fields return 'unknown'.
+        """
+        desc_clean = description_str.strip()
+        titer = "unknown"
+        volume = "unknown"
 
-#         location = indicator.injection_location
-#         coords = indicator.injection_coordinates_in_mm
-#         if location and coords:
-#             coord_id = cls.make_coordinates_id(coords)
-#             cls.insert1(
-#                 {
-#                     "construct_name": indicator.label,
-#                     "injection_location": location,
-#                     "injection_coordinates_id": coord_id,
-#                     "injection_coordinates_in_mm": coords,
-#                 },
-#                 skip_duplicates=True,
-#             )
+        # Find titer (case-insensitive)
+        titer_match = re.search(r"titer in vg/mL:\s*([^\.]+)", description_str, re.IGNORECASE)
+        if titer_match:
+            titer = titer_match.group(1).strip()
+
+        # Find volume (case-insensitive)
+        volume_match = re.search(r"volume in uL:\s*([^\.]+)", description_str, re.IGNORECASE)
+        if volume_match:
+            volume = volume_match.group(1).strip()
+
+        # Remove titer/volume parts from the description (case-insensitive)
+        desc_clean = re.sub(r"\.?\s*titer in vg/mL:.*", "", desc_clean, flags=re.IGNORECASE).strip()
+        desc_clean = re.sub(r"\.?\s*volume in uL:.*", "", desc_clean, flags=re.IGNORECASE).strip()
+
+        return desc_clean, titer, volume
+
+
+    @classmethod
+    def insert_from_indicator(cls, indicator):
+        """
+        Insert injection data from an ndx_fiber_photometry.Indicator object
+        if it includes location and coordinate metadata.
+        """
+        if not (hasattr(indicator, "injection_location") and hasattr(indicator, "injection_coordinates_in_mm")):
+            logger.debug(f"No injection metadata for indicator: {getattr(indicator, 'label')}")
+            return
+        
+        # Parse titer and volume from description
+        desc, titer, volume = cls._parse_titer_volume(getattr(indicator, "description", ""))
+
+        location = indicator.injection_location
+        coords = indicator.injection_coordinates_in_mm
+        rounded_string_coords = ",".join(f"{round(c, 1):.1f}" for c in coords)
+        cls.insert1(
+            {
+                "construct_name": indicator.label,
+                "injection_coords": rounded_string_coords,
+                "titer_in_vg_per_ml": titer,
+                "volume_in_ul": volume,
+                "injection_location": location,
+                "injection_coords_in_mm": coords,
+            },
+            skip_duplicates=True,
+        )
+        logger.info(f"Inserted IndicatorInjection for {indicator.label} at coords {rounded_string_coords}")
 
 
 @schema
@@ -414,7 +465,7 @@ class FiberPhotometrySeries(SpyglassMixin, dj.Manual):
                         "nwb_file_name": nwb_file_name,
                         "interval_list_name": series_interval_list_name,
                         "valid_times": np.array([[phot_times[0], phot_times[-1]]]),
-                        "pipeline": "fiber_photometry"
+                        "pipeline": "berke_fiber_photometry"
                     }, skip_duplicates=True
                 )
 
@@ -488,7 +539,5 @@ class FiberPhotometrySeries(SpyglassMixin, dj.Manual):
             Dict mapping series name to FiberPhotometryResponseSeries object.
         """
         session_nwb = (Nwbfile() & {"nwb_file_name": nwb_file_name}).fetch_nwb()[0]
-
         all_photometry_series = get_photometry_series(nwbfile=session_nwb)
-
         return {series.name: series for series in all_photometry_series}
