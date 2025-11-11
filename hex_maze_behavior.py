@@ -570,8 +570,44 @@ class HexPosition(SpyglassMixin, dj.Computed):
         AnalysisNwbfile().add(key["nwb_file_name"], key["analysis_file_name"])
         self.insert1(key)
 
+
     def fetch1_dataframe(self):
         return self.fetch_nwb()[0]["hex_assignment"].set_index('time')
+    
+
+    def fetch_hex_and_position_dataframe(self, key):
+        """Fetch a combined hex and position dataframe filtered to valid times."""
+
+        # Get all blocks for this epoch so we can filter to only valid times
+        blocks = (HexMazeBlock & key).fetch()
+        first_block = blocks[0]
+        last_block = blocks[-1]
+
+        first_block_start, first_block_end = (IntervalList & {
+            'nwb_file_name': key["nwb_file_name"],
+            'interval_list_name': first_block['interval_list_name']
+        }).fetch1('valid_times')[0]
+
+        last_block_start, last_block_end = (IntervalList & {
+            'nwb_file_name': key["nwb_file_name"],
+            'interval_list_name': last_block['interval_list_name']
+        }).fetch1('valid_times')[0]
+
+        # Get processed xy position from the PositionOutput table
+        xy_position_df = (PositionOutput & {"merge_id": key["pos_merge_id"]}).fetch1_dataframe()
+
+        # Get hex position from the HexPosition table
+        # Note in the HexPosition table, we have to use 'pos_merge_id' instead of 'merge_id'
+        hex_position_df = (self & key).fetch1_dataframe()
+
+        # Combine x,y position with assigned hex position
+        full_position_df = xy_position_df.join(hex_position_df, on='time')
+
+        # Filter position data to only include times between first block start and last block end
+        mask = (full_position_df.index >= first_block_start) & (full_position_df.index <= last_block_end)
+        full_position_df  = full_position_df.loc[mask]
+
+        return full_position_df
 
 
 # @schema
