@@ -194,8 +194,8 @@ class DecodedHexPosition(SpyglassMixin, dj.Computed):
                 block_hex_centroids.pop(hex_id, None)
 
             # Convert hex_centroids to array for fast computation
-            hex_ids = list(hex_centroids.keys())
-            hex_coords = np.array(list(hex_centroids.values()))  # shape (n_hexes, 2)
+            hex_ids = list(block_hex_centroids.keys())
+            hex_coords = np.array(list(block_hex_centroids.values()))  # shape (n_hexes, 2)
 
             # Compute distances from each x, y position to each hex centroid
             positions = block_positions[['pred_x', 'pred_y']].to_numpy()  # shape (n_positions, 2)

@@ -6,7 +6,6 @@ from pynwb import NWBHDF5IO
 import spyglass.common as sgc
 from spyglass.common import Nwbfile, TaskEpoch, IntervalList, Session, AnalysisNwbfile
 from spyglass.position import PositionOutput
-from spyglass.decoding.decoding_merge import DecodingOutput
 from spyglass.utils.dj_mixin import SpyglassMixin
 
 from hexmaze import get_maze_attributes
@@ -526,164 +525,13 @@ class HexPosition(SpyglassMixin, dj.Computed):
             barrier_hexes = maze_config.split(',')
 
             # Remove the barrier hexes from our centroids dict
+            block_hex_centroids = hex_centroids.copy()
             for hex_id in barrier_hexes:
-                hex_centroids.pop(hex_id, None)
+                block_hex_centroids.pop(hex_id, None)
 
             # Convert hex_centroids to array for fast computation
-            hex_ids = list(hex_centroids.keys())
-            hex_coords = np.array(list(hex_centroids.values()))  # shape (n_hexes, 2)
-
-            # Compute distances from each x, y position to each hex centroid
-            positions = block_positions[['position_x', 'position_y']].to_numpy()  # shape (n_positions, 2)
-            diffs = positions[:, np.newaxis, :] - hex_coords[np.newaxis, :, :]  # shape (n_positions, n_hexes, 2)
-            dists = np.linalg.norm(diffs, axis=2)  # shape (n_positions, n_hexes)
-
-            # Find the closest hex centroid for each x, y position
-            closest_idx = np.argmin(dists, axis=1)
-            closest_hex_incl_sides = [hex_ids[i] for i in closest_idx]
-
-            # Calculate the distance from the centroid for each closest hex
-            distance_from_centroid = np.min(dists, axis=1)
-
-            # Closest_hex_incl_sides includes ids for the 6 side hexes next to the reward ports (e.g '4_left')
-            # Closest_core_hex assigns the side hexes to their "core" hex (e.g. '4_left' and '4_right') become 4
-            closest_core_hex = [int(re.match(r"\d+", hex_id).group()) for hex_id in closest_hex_incl_sides]
-
-            # Add info for this block to hex_df
-            hex_df.loc[block_positions.index, "hex"] = closest_core_hex
-            hex_df.loc[block_positions.index, "hex_including_sides"] = closest_hex_incl_sides
-            hex_df.loc[block_positions.index, "distance_from_centroid"] = distance_from_centroid
-
-        # Save time as a column instead so we don't have float indices
-        hex_df["time"] = hex_df.index
-        hex_df = hex_df.reset_index(drop=True)
-
-        # Create an empty AnalysisNwbfile with a link to the original nwb
-        analysis_file_name = AnalysisNwbfile().create(key["nwb_file_name"])
-        # Store the name of this newly created AnalysisNwbfile 
-        key["analysis_file_name"] = analysis_file_name
-        # Add the computed hex dataframe to the AnalysisNwbfile 
-        key["hex_assignment_object_id"] = AnalysisNwbfile().add_nwb_object(
-            analysis_file_name, hex_df, "hex_dataframe"
-        )
-        # Create an entry in the AnalysisNwbfile table (like insert1)
-        AnalysisNwbfile().add(key["nwb_file_name"], key["analysis_file_name"])
-        self.insert1(key)
-
-    def fetch1_dataframe(self):
-        return self.fetch_nwb()[0]["hex_assignment"].set_index('time')
-
-
-@schema
-class DecodedHexPositionSelection(SpyglassMixin, dj.Manual):
-    """
-    Note we inherit from TaskEpoch instead of HexMazeBlock because we want
-    nwb_file_name and epoch (but not block) as primary keys.
-    The session must exist in the HexMazeBlock table (populated via populate_all_hexmaze).
-    """
-
-    definition = """
-    -> DecodingOutput.proj(decoding_merge_id = "merge_id")
-    -> TaskEpoch
-    -> HexCentroids
-    ---
-    """
-
-    @classmethod
-    def get_all_valid_keys(cls, verbose=True):
-        """
-        Return a list of valid composite keys (nwb_file_name, epoch, merge_id) 
-        for sessions that have HexMazeBlock, PositionOutput, and HexCentroids data.
-        These keys can be used to populate the HexPositionSelection table.
-        
-        Use verbose=False to suppress print output.
-        """
-        all_valid_keys = []
-
-        # Loop through all unique nwbfiles in the HexMazeBlock table
-        for nwb_file_name in set(HexMazeBlock.fetch("nwb_file_name")):
-            key = {"nwb_file_name": nwb_file_name}
-
-            # Make sure an entry in HexCentroids exists for this nwbfile
-            if not len(HexCentroids & {"nwb_file_name": nwb_file_name}):
-                if verbose:
-                    print(f"No HexCentroids entry found for nwbfile {nwb_file_name}, skipping.")
-                continue
-
-            # Loop through all unique epochs
-            for epoch in set((HexMazeBlock & key).fetch("epoch")):
-                decoding_output_key = {
-                    "nwb_file_name": key["nwb_file_name"],
-                    "interval_list_name": f"pos {epoch} valid times"
-                }
-
-                # Fetch the merge_ids for this nwb + epoch combination (if it exists in the DecodingOutput table)
-                try:
-                    merge_ids = (DecodingOutput.merge_get_part(decoding_output_key)).fetch("KEY")
-                except ValueError as e:
-                    if verbose:
-                        print(f"No DecodingOutput entry found for {decoding_output_key}, skipping.")
-                    continue
-
-                for merge_id in merge_ids:
-                    composite_key = {
-                        "nwb_file_name": nwb_file_name,
-                        "epoch": epoch,
-                        **merge_id
-                    }
-                    all_valid_keys.append(composite_key)
-        return all_valid_keys
-
-
-@schema
-class HexPosition(SpyglassMixin, dj.Computed):
-    definition = """
-    -> HexPositionSelection
-    ---
-    -> AnalysisNwbfile
-    hex_assignment_object_id: varchar(128)
-    """
-
-    def make(self, key):
-        # Get a dict of hex: (x, y) centroid in cm for this nwbfile
-        hex_centroids = HexCentroids.get_hex_centroids_dict_cm(key)
-
-        # Get the rat's position for this epoch from the PositionOutput table
-        pos_key = {"merge_id": key["pos_merge_id"]} # in case the key contains multiple 'merge_id'
-        position_df = (PositionOutput & pos_key).fetch1_dataframe()
-
-        # Set up a new df to store assigned hex info for each index in position_df
-        # (We use -1 and "None" instead of nan to avoid HDF5 datatype issues)
-        hex_df = pd.DataFrame({
-            "hex": np.full(len(position_df), -1),
-            "hex_including_sides": ["None"] * len(position_df),
-            "distance_from_centroid": np.full(len(position_df), -1.0)
-        }, index=position_df.index)
-    
-        # Loop through all blocks within this epoch
-        for block in (HexMazeBlock & {"nwb_file_name": key["nwb_file_name"], "epoch": key["epoch"]}):
-
-            # Get the block start and end times
-            block_start, block_end = (IntervalList & 
-                        {'nwb_file_name': key['nwb_file_name'], 
-                        'interval_list_name': block['interval_list_name']}
-                        ).fetch1('valid_times')[0]
-
-            # Filter position_df to only include times for this block
-            block_mask = (position_df.index >= block_start) & (position_df.index <= block_end)
-            block_positions = position_df.loc[block_mask]
-
-            # Get the hex maze config for this block
-            maze_config = block.get('config_id')
-            barrier_hexes = maze_config.split(',')
-
-            # Remove the barrier hexes from our centroids dict
-            for hex_id in barrier_hexes:
-                hex_centroids.pop(hex_id, None)
-
-            # Convert hex_centroids to array for fast computation
-            hex_ids = list(hex_centroids.keys())
-            hex_coords = np.array(list(hex_centroids.values()))  # shape (n_hexes, 2)
+            hex_ids = list(block_hex_centroids.keys())
+            hex_coords = np.array(list(block_hex_centroids.values()))  # shape (n_hexes, 2)
 
             # Compute distances from each x, y position to each hex centroid
             positions = block_positions[['position_x', 'position_y']].to_numpy()  # shape (n_positions, 2)
