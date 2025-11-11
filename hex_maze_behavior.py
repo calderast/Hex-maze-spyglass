@@ -573,32 +573,48 @@ class HexPosition(SpyglassMixin, dj.Computed):
 
     def fetch1_dataframe(self):
         return self.fetch_nwb()[0]["hex_assignment"].set_index('time')
-    
 
-    def fetch_hex_and_position_dataframe(self, key):
-        """Fetch a combined hex and position dataframe filtered to valid times."""
+
+    def fetch_hex_and_position_dataframe(self, key=None):
+        """
+        Fetch a combined hex and position dataframe filtered to valid times.
+
+        Works whether called as:
+            HexPosition().fetch_hex_and_position_dataframe(key)
+        or
+            (HexPosition & key).fetch_hex_and_position_dataframe()
+
+        Returns
+        -------
+        pd.DataFrame
+            Combined position + hex dataframe filtered to valid block times.
+        """
+
+        # Allow usage with restricted table or explicit key
+        entry = self if key is None else (self & key)
+        key = entry.fetch1("KEY")
 
         # Get all blocks for this epoch so we can filter to only valid times
         blocks = (HexMazeBlock & key).fetch()
-        first_block = blocks[0]
-        last_block = blocks[-1]
+
+        if len(blocks) == 0:
+            raise ValueError(f"No HexMazeBlock entries found for key: {key}")
 
         first_block_start, first_block_end = (IntervalList & {
             'nwb_file_name': key["nwb_file_name"],
-            'interval_list_name': first_block['interval_list_name']
+            'interval_list_name': blocks[0]['interval_list_name']
         }).fetch1('valid_times')[0]
 
         last_block_start, last_block_end = (IntervalList & {
             'nwb_file_name': key["nwb_file_name"],
-            'interval_list_name': last_block['interval_list_name']
+            'interval_list_name': blocks[-1]['interval_list_name']
         }).fetch1('valid_times')[0]
 
         # Get processed xy position from the PositionOutput table
         xy_position_df = (PositionOutput & {"merge_id": key["pos_merge_id"]}).fetch1_dataframe()
 
         # Get hex position from the HexPosition table
-        # Note in the HexPosition table, we have to use 'pos_merge_id' instead of 'merge_id'
-        hex_position_df = (self & key).fetch1_dataframe()
+        hex_position_df = entry.fetch1_dataframe()
 
         # Combine x,y position with assigned hex position
         full_position_df = xy_position_df.join(hex_position_df, on='time')

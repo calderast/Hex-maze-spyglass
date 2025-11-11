@@ -236,3 +236,53 @@ class DecodedHexPosition(SpyglassMixin, dj.Computed):
 
     def fetch1_dataframe(self):
         return self.fetch_nwb()[0]["hex_assignment"].set_index('time')
+
+    def fetch_hex_and_position_dataframe(self, key=None):
+        """
+        Fetch a combined hex and decoded position dataframe filtered to valid times.
+
+        Works whether called as:
+            DecodedHexPosition().fetch_hex_and_position_dataframe(key)
+        or
+            (DecodedHexPosition & key).fetch_hex_and_position_dataframe()
+
+        Returns
+        -------
+        pd.DataFrame
+            Combined decoded position + hex dataframe filtered to valid block times.
+        """
+
+        # Allow usage with restricted table or explicit key
+        entry = self if key is None else (self & key)
+        key = entry.fetch1("KEY")
+
+        # Get all blocks for this epoch so we can filter to only valid times
+        blocks = (HexMazeBlock & key).fetch()
+
+        if len(blocks) == 0:
+            raise ValueError(f"No HexMazeBlock entries found for key: {key}")
+
+        first_block_start, first_block_end = (IntervalList & {
+            'nwb_file_name': key["nwb_file_name"],
+            'interval_list_name': blocks[0]['interval_list_name']
+        }).fetch1('valid_times')[0]
+
+        last_block_start, last_block_end = (IntervalList & {
+            'nwb_file_name': key["nwb_file_name"],
+            'interval_list_name': blocks[-1]['interval_list_name']
+        }).fetch1('valid_times')[0]
+
+        # Get decoded xy position from the DecodedPosition table
+        xy_position_df = (DecodedPosition & key).fetch1_dataframe()
+
+        # Get hex position from the HexPosition table
+        hex_position_df = entry.fetch1_dataframe()
+
+        # Combine x,y position with assigned hex position
+        full_position_df = xy_position_df.join(hex_position_df, on='time')
+
+        # Filter position data to only include times between first block start and last block end
+        mask = (full_position_df.index >= first_block_start) & (full_position_df.index <= last_block_end)
+        full_position_df  = full_position_df.loc[mask]
+
+        return full_position_df
