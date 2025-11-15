@@ -8,7 +8,13 @@ from spyglass.common import Nwbfile, TaskEpoch, IntervalList, Session, AnalysisN
 from spyglass.position import PositionOutput
 from spyglass.utils.dj_mixin import SpyglassMixin
 
-from hexmaze import get_maze_attributes
+from hexmaze import (
+    get_maze_attributes, 
+    get_critical_choice_points, 
+    divide_into_thirds, 
+    classify_maze_hexes, 
+    get_hexes_from_port,
+)
 
 schema = dj.schema("hex_maze")
 
@@ -626,104 +632,172 @@ class HexPosition(SpyglassMixin, dj.Computed):
         return full_position_df
 
 
-# @schema
-# class HexMazeTraversal(dj.Manual):
-#     """
-#     Stores each hex transition within a trial, including entry/exit times,
-#     surrounding hexes, and distance to/from ports.
-    
-#     TODO: add fields choice_point, critical_choice_point,
-    
-#     newly available and newly blocked as properties of a maze
-#     """
+@schema
+class HexPath(dj.Computed):
+    """
+    Stores each hex transition within a trial, including entry/exit times,
+    maze component, and distance to/from ports.
+    """
 
-#     definition = """
-#     -> HexMazeBlock.Trial
-#     hex_in_trial: int           # the nth hex entered in this trial
-#     ---
-#     entry_in_trial: int         # numbered entry into this hex for this trial (1 = first entry)
-#     hex: int                    # the id of the hex
-#     entry_time: float           # the time the rat entered this hex
-#     exit_time: float            # the time the rat exited this hex
-#     duration: float             # the amount of time spent in this hex during this entry
-#     from_hex: int               # the id of the previous hex on the rat's path
-#     to_hex: int                 # the id of the next hex on the rat's path
-#     hexes_from_port: int        # the distance (in hexes) from the end port of this trial
-#     hexes_to_port: int          # the distance (in hexes) from the start port of this trial
-#     hex_type: varchar(20)       # optimal, non-optimal, or dead-end
-#     # inverse maybe?
-#     """
-    
-#     # TODO: how to classify hexes not on optimal path from from to to
+    definition = """
+    -> HexPosition
+    ---
+    -> AnalysisNwbfile
+    hex_path_object_id: varchar(128)
+    """
 
-#     # add hex or maybe make this add hexes from trial
-#     def add_trial(self, trial_info: HexMazeBlock.Trial):
-#         # Fetch trial info
-#         trial_info = (HexMazeBlock.Trial & key).fetch1() # only needed if we pass key vs the object - havent decided yet
-#         config_id = (HexMazeBlock & key).fetch1('config_id')
+    def make(self, key):
+        # Get hex position dataframe for this nwb+epoch
+        hex_position_df = (HexPosition & key).fetch1_dataframe()
 
-#         start_port = trial_info['start_port']
-#         end_port = trial_info['end_port']
+        # Get trials for this nwb+epoch
+        trials = (HexMazeBlock().Trial() & {"nwb_file_name": key["nwb_file_name"], "epoch": key["epoch"]})
         
-#         # Loop though hex assignment for this trial
-#         # compute the secondary keys
-#         # self.insert1() with a dict of all keys and values
+        # Accumulate per-trial dataframes
+        all_hex_paths = []
+
+        for trial in trials:
+            # Get trial time bounds
+            trial_start, trial_end = (IntervalList & {
+                'nwb_file_name': trial["nwb_file_name"],
+                'interval_list_name': trial['interval_list_name']
+            }).fetch1('valid_times')[0]
+
+            # Get maze configuration and attributes
+            maze = (HexMazeBlock() & {
+                'nwb_file_name': trial['nwb_file_name'], 
+                'block': trial['block'],
+                'epoch': trial['epoch']
+            }).fetch1('config_id')
+            critical_choice_points = get_critical_choice_points(maze)
+            hex_type_dict = classify_maze_hexes(maze)
+
+            # Filter position data to this trial
+            trial_mask = (hex_position_df.index >= trial_start) & (hex_position_df.index <= trial_end)
+            trial_position_df = hex_position_df.loc[trial_mask].copy()
+
+            # Identify contiguous hex segments
+            trial_position_df["segment"] = (trial_position_df["hex"] != trial_position_df["hex"].shift()).cumsum()
+
+            # Set up dataframe of hex entries for this trial
+            hex_path = (
+                trial_position_df.groupby("segment")
+                .agg(
+                    hex=("hex", "first"),
+                    entry_time=("hex", lambda x: x.index[0]),
+                    exit_time=("hex", lambda x: x.index[-1]),
+                )
+                .reset_index(drop=True)
+            )
+
+            # Time spent in each hex
+            hex_path["duration"] = hex_path["exit_time"] - hex_path["entry_time"]
+
+            # What number hex entry in the trial this is
+            hex_path["hex_in_trial"] = range(1, len(hex_path) + 1)
+
+            # Count the number of times the rat has entered this specific hex in this trial
+            hex_path["hex_entry_num"] = hex_path.groupby("hex").cumcount() + 1
+
+            # For each hex, compute distances to start and end port
+            if trial["start_port"] == "None": # first trial does not have a start port, so we just fill with -1
+                hex_path["hexes_from_start"] = [-1] * len(hex_path)
+            else:
+                hex_path["hexes_from_start"] = [
+                    get_hexes_from_port(maze, start_hex=h, reward_port=trial["start_port"])
+                    for h in hex_path["hex"]
+                ]
+            hex_path["hexes_from_end"] = [
+                get_hexes_from_port(maze, start_hex=h, reward_port=trial["end_port"])
+                for h in hex_path["hex"]
+            ]
+
+            # Classify each hex as optimal, non-optimal, or dead-end
+            hex_to_type = {
+                h: group_name.replace("_hexes", "")
+                for group_name, hexes in hex_type_dict.items()
+                if group_name in {"optimal_hexes", "non_optimal_hexes", "dead_end_hexes"}
+                for h in hexes
+            }
+            hex_path["hex_type"] = hex_path["hex"].map(hex_to_type)
+            # Mark choice points
+            hex_path["hex_type"] = hex_path.apply(
+                lambda row: "choice_point" if row["hex"] in critical_choice_points else row["hex_type"],
+                axis=1
+            )
+
+            # Map each hex to the section of the maze it's in (1, 2, or 3 for near port A, B, or C)
+            thirds = divide_into_thirds(maze)
+            hex_to_maze_third = {h: third_num for third_num, hexes in enumerate(thirds, start=1) for h in hexes}
+            # Map choice points to section 0
+            hex_to_maze_third.update({h: 0 for h in critical_choice_points})
+
+            # Identify the maze sections as 'start', 'chosen', or 'unchosen'
+            # Note that for the first trial, start_port is None so start_section and unchosen_section will both be None
+            port_map = {"A": 1, "B": 2, "C": 3}
+            start_section  = port_map.get(trial["start_port"])
+            chosen_section = port_map.get(trial["end_port"])
+            unchosen_section = {1, 2, 3} - {chosen_section} - {start_section}
+            unchosen_section = unchosen_section.pop() if len(unchosen_section) == 1 else None
+
+            # Map maze section number to its label 
+            label = {start_section: "start", chosen_section: "chosen", unchosen_section: "unchosen", 0: "choice_point"}
+
+            # Assign maze section label for each hex (if no label, e.g. first section of first trial, it will be None)
+            hex_path["maze_portion"] = hex_path["hex"].map(lambda h: label.get(hex_to_maze_third.get(h)))
+
+            # Add trial number and block columns
+            hex_path["block_trial_num"] = trial["block_trial_num"]
+            hex_path["block"] = trial["block"]
+            # Put the trial and block columns on the left
+            hex_path = hex_path[["block", "block_trial_num"] + 
+                                [c for c in hex_path.columns if c not in {"block", "block_trial_num"}]]
+            
+            # Add the hex path for this trial
+            all_hex_paths.append(hex_path)
+
+        # Concatenate per-trial dataframes into one big dataframe
+        hex_path_all_trials = pd.concat(all_hex_paths, ignore_index=True)
+
+        # Create an empty AnalysisNwbfile with a link to the original nwb
+        analysis_file_name = AnalysisNwbfile().create(key["nwb_file_name"])
+        # Store the name of this newly created AnalysisNwbfile 
+        key["analysis_file_name"] = analysis_file_name
+        # Add the hex path dataframe to the AnalysisNwbfile 
+        key["hex_path_object_id"] = AnalysisNwbfile().add_nwb_object(
+            analysis_file_name, hex_path_all_trials, "hex_path"
+        )
+        # Create an entry in the AnalysisNwbfile table (like insert1)
+        AnalysisNwbfile().add(key["nwb_file_name"], key["analysis_file_name"])
+        self.insert1(key)
 
 
-#         # Get the trial start and end times
-#         trial_interval = (IntervalList & {
-#             'nwb_file_name': key['nwb_file_name'],
-#             'interval_list_name': trial_info['trial_interval']
-#         }).fetch1('valid_times')
-#         trial_start, trial_end = trial_interval
-
-#         # Filter assigned hex data for the trial time interval
-#         hex_positions_for_this_trial = hex_assignment_df[(hex_assignment_df.index >= trial_start) 
-#                                                          & (hex_assignment_df.index <= trial_end)]
-
-#         # Get hex ID column
-    
-
-    #     # Find transitions
-    #     entries = []
-    #     prev_hex = None
-    #     for i in range(1, len(assigned_hexes)):
-    #         if assigned_hexes[i] != assigned_hexes[i - 1]:
-    #             exit_time = timestamps[i]
-    #             entry_time = timestamps[i - 1]
-    #             from_hex = assigned_hexes[i - 1]
-    #             to_hex = assigned_hexes[i]
-                
-    #             # TODO: add a check for if the transition is valid.
-    #             # If not, hopefully the hex position has only jumped over 1 hex
-    #             # Assign a couple indices to the intermediate hex so we dont break things
-
-    #             hex_id = from_hex
-    #             hexes_from = calculate_hexes_from_port(hex_id, start_port, config_id)
-    #             hexes_to = calculate_hexes_to_port(hex_id, end_port, config_id)
-
-    #             entries.append({
-    #                 **key,
-    #                 'hex_index': len(entries),
-    #                 'hex': hex_id,
-    #                 'entry_time': entry_time,
-    #                 'exit_time': exit_time,
-    #                 'duration': exit_time - entry_time,
-    #                 'from_hex': prev_hex if prev_hex is not None else from_hex,
-    #                 'to_hex': to_hex,
-    #                 'hexes_from_port': hexes_from,
-    #                 'hexes_to_port': hexes_to,
-    #             })
-
-    #             prev_hex = from_hex
-
-    #     self.insert(entries)
+    def fetch1_dataframe(self):
+        return self.fetch_nwb()[0]["hex_path"]
 
 
+    def fetch_block(self, block):
+        """Return hex_path rows for a specific block."""
+        df = self.fetch1_dataframe()
+        df_block = df[df["block"] == block]
+        return df_block.reset_index(drop=True)
 
-# Future TODO: add an opto table
+
+    def fetch_trial(self, block, block_trial_num):
+        """Return hex_path rows for a specific trial within a block."""
+        df = self.fetch1_dataframe()
+        df_trial = df[
+            (df["block"] == block) &
+            (df["block_trial_num"] == block_trial_num)
+        ]
+        return df_trial.reset_index(drop=True)
 
 
-# hex ID, dead end?, hexes from port, hexes to port, optimal path?,  choice point?
-
-# entry, exit
+    def fetch_trials(self, block=None, block_trial_num=None):
+        """Return hex_path rows optionally filtered to specific blocks or trials"""
+        df = self.fetch1_dataframe()
+        if block is not None:
+            df = df[df["block"] == block]
+        if block_trial_num is not None:
+            df = df[df["block_trial_num"] == block_trial_num]
+        return df.reset_index(drop=True)
