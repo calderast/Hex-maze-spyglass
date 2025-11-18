@@ -14,6 +14,8 @@ from hexmaze import (
     divide_into_thirds, 
     classify_maze_hexes, 
     get_hexes_from_port,
+    get_choice_direction,
+    get_path_length_difference,
 )
 
 schema = dj.schema("hex_maze")
@@ -142,8 +144,8 @@ class HexMazeConfig(SpyglassMixin, dj.Manual):
 class HexMazeBlock(SpyglassMixin, dj.Manual):
     """
     Contains data for each block in the Hex Maze task.
-    Calling load_from_nwb to populate this table also
-    populates the Trial part table and HexMazeConfig table.
+    Calling load_from_nwb to populate this table also populates the 
+    Trial part table, the HexMazeConfig table, and the HexMazeChoice table.
 
     HexMazeBlock inherits primary keys nwb_file_name and epoch from TaskEpoch, 
     and inherits secondary keys config_id from HexMazeConfig 
@@ -260,6 +262,9 @@ class HexMazeBlock(SpyglassMixin, dj.Manual):
                 trials_to_insert.append(trial_key)
 
             HexMazeBlock.Trial.insert(trials_to_insert, skip_duplicates=True)
+            
+            # Populate HexMazeChoice for all new trials
+            HexMazeChoice.populate()
 
 
     def join_with_trial(self):
@@ -282,6 +287,72 @@ class HexMazeBlock(SpyglassMixin, dj.Manual):
         hmbt = hmbt.proj(**hmbt_proj_dict)
 
         return hmb * hmbt
+
+
+@schema
+class HexMazeChoice(dj.Computed):
+    """
+    Automatically computes choice direction, reward probability difference, 
+    and path length difference for each entry in HexMazeBlock.Trial.
+    The first trial of each epoch is excluded because there is no start_port.
+    """
+    definition = """
+    -> HexMazeBlock.Trial
+    ---
+    choice_direction: varchar(16)   # 'left' or 'right'
+    reward_prob_diff: float         # reward probability difference
+    path_length_diff: float         # path length difference
+    """
+
+    @staticmethod
+    def get_reward_prob_difference(trial_row) -> float:
+        """
+        Helper to compute the reward probability difference for a trial row.
+
+        Parameters:
+            trial_row (dict or DataFrame row): must contain keys:
+                'p_a', 'p_b', 'p_c', 'start_port', 'end_port'
+
+        Returns:
+            float: p(chosen) - p(unchosen)
+        """
+        pa, pb, pc = trial_row['p_a'], trial_row['p_b'], trial_row['p_c']
+        start_port = trial_row['start_port']
+        end_port = trial_row['end_port']
+
+        port_probs = {"A": pa, "B": pb, "C": pc}
+
+        chosen_prob = port_probs[end_port]
+        unchosen_port = ({'A', 'B', 'C'} - {start_port, end_port}).pop()
+        unchosen_prob = port_probs[unchosen_port]
+
+        return chosen_prob - unchosen_prob
+
+
+    def make(self, key):
+        # Fetch the block + trial row
+        trial_row = (HexMazeBlock().join_with_trial() & key).fetch1()
+        
+        # Skip this trial if start_port is None (first trial of the epoch)
+        if trial_row['start_port'] == 'None':
+            return
+
+        maze = trial_row['config_id']
+        start_port = trial_row['start_port']
+        end_port = trial_row['end_port']
+
+        # Compute choice features
+        choice_direction = get_choice_direction(start_port, end_port)
+        reward_prob_diff= self.get_reward_prob_difference(trial_row)
+        path_length_diff = get_path_length_difference(maze, start_port, end_port)
+
+        # Insert features
+        self.insert1({
+            **key,
+            'choice_direction': choice_direction,
+            'reward_prob_diff': reward_prob_diff,
+            'path_length_diff': path_length_diff
+        })
 
 
 @schema
