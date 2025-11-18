@@ -633,7 +633,7 @@ class HexPosition(SpyglassMixin, dj.Computed):
 
 
 @schema
-class HexPath(dj.Computed):
+class HexPath(SpyglassMixin, dj.Computed):
     """
     Stores each hex transition within a trial, including entry/exit times,
     maze component, and distance to/from ports.
@@ -743,8 +743,8 @@ class HexPath(dj.Computed):
             # Map maze section number to its label 
             label = {start_section: "start", chosen_section: "chosen", unchosen_section: "unchosen", 0: "choice_point"}
 
-            # Assign maze section label for each hex (if no label, e.g. first section of first trial, it will be None)
-            hex_path["maze_portion"] = hex_path["hex"].map(lambda h: label.get(hex_to_maze_third.get(h)))
+            # Assign maze section label for each hex (if no label, e.g. first section of first trial, it will be "None")
+            hex_path["maze_portion"] = hex_path["hex"].map(lambda h: label.get(hex_to_maze_third.get(h))).astype("str")
 
             # Add trial number and block columns
             hex_path["block_trial_num"] = trial["block_trial_num"]
@@ -796,8 +796,17 @@ class HexPath(dj.Computed):
     def fetch_trials(self, block=None, block_trial_num=None):
         """Return hex_path rows optionally filtered to specific blocks or trials"""
         df = self.fetch1_dataframe()
+        
         if block is not None:
-            df = df[df["block"] == block]
+            if isinstance(block, (list, tuple, set)):
+                df = df[df["block"].isin(block)]
+            else:
+                df = df[df["block"] == block]
+
         if block_trial_num is not None:
-            df = df[df["block_trial_num"] == block_trial_num]
+            if isinstance(block_trial_num, (list, tuple, set)):
+                df = df[df["block_trial_num"].isin(block_trial_num)]
+            else:
+                df = df[df["block_trial_num"] == block_trial_num]
+                
         return df.reset_index(drop=True)
