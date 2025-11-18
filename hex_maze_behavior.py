@@ -262,6 +262,28 @@ class HexMazeBlock(SpyglassMixin, dj.Manual):
             HexMazeBlock.Trial.insert(trials_to_insert, skip_duplicates=True)
 
 
+    def join_with_trial(self):
+        """
+        Join a restricted HexMazeBlock query (self) with its Trial part table,
+        renaming conflicting `interval_list_name` columns to `block_interval_list_name`
+        and `trial_interval_list_name`.
+        """
+        hmb = self # HexMazeBlock
+        hmbt = self.Trial # HexMazeBlock.Trial
+
+        # Build projection that renames interval_list_name to block_interval_list_name and keeps everything else
+        hmb_attrs_to_keep = [a for a in hmb.heading.names if a != 'interval_list_name']
+        hmb_proj_dict = {**{a: a for a in hmb_attrs_to_keep}, 'block_interval_list_name': 'interval_list_name'}
+        hmb = hmb.proj(**hmb_proj_dict)
+
+        # Build projection that renames interval_list_name to trial_interval_list_name and keeps everything else
+        hmbt_attrs_to_keep = [a for a in hmbt.heading.names if a != 'interval_list_name']
+        hmbt_proj_dict = {**{a: a for a in hmbt_attrs_to_keep}, 'trial_interval_list_name': 'interval_list_name'}
+        hmbt = hmbt.proj(**hmbt_proj_dict)
+
+        return hmb * hmbt
+
+
 @schema
 class HexCentroids(dj.Imported):
     """
