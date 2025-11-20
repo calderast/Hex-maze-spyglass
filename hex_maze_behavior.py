@@ -265,9 +265,12 @@ class HexMazeBlock(SpyglassMixin, dj.Manual):
                 trials_to_insert.append(trial_key)
 
             HexMazeBlock.Trial.insert(trials_to_insert, skip_duplicates=True)
-            
+
             # Populate HexMazeChoice for all new trials
             HexMazeChoice.populate()
+
+            # Populate HexMazeTrialHistory for all new trials
+            HexMazeTrialHistory.populate()
 
 
     def join_with_trial(self):
@@ -355,6 +358,119 @@ class HexMazeChoice(dj.Computed):
             'choice_direction': choice_direction,
             'reward_prob_diff': reward_prob_diff,
             'path_length_diff': path_length_diff
+        })
+
+
+class HexMazeTrialContext:
+    """
+    Context for analyzing a single trial's history within its epoch.
+    Initialize with a trial key, automatically loads epoch history.
+    """
+
+    def __init__(self, trial_key):
+        # Load the current trial
+        self.trial = (HexMazeBlock.Trial & trial_key).fetch1()
+        self.trial_num = self.trial["epoch_trial_num"]
+
+        # Load all trials from this epoch
+        epoch_key = {"nwb_file_name": trial_key["nwb_file_name"], "epoch": trial_key["epoch"]}
+        self.epoch_trials = (HexMazeBlock.Trial & epoch_key).fetch(order_by="epoch_trial_num", as_dict=True)
+
+    @property
+    def history(self):
+        """All trials before the current one in chronological order."""
+        return self.epoch_trials[:self.trial_num - 1]
+
+    def was_rewarded_n_trials_ago(self, trials_ago=1):
+        """Was the trial N trials ago rewarded?"""
+        idx = self.trial_num - 1 - trials_ago
+        if 0 <= idx < len(self.history):
+            return bool(self.history[idx]["reward"])
+        return False
+
+    def previous_visits_to_port(self):
+        """All previous visits to the current trial's end port."""
+        end_port = self.trial["end_port"]
+        return [t for t in self.history if t["end_port"] == end_port]
+
+    def previous_visits_same_path(self):
+        """All previous trials with same start and end port as current trial."""
+        start_port = self.trial["start_port"]
+        end_port = self.trial["end_port"]
+        return [t for t in self.history 
+                if t["start_port"] == start_port and t["end_port"] == end_port]
+
+    def last_visit_to_port_rewarded(self, visits_ago=1):
+        """Was the Nth most recent visit to this port rewarded?"""
+        visits = self.previous_visits_to_port()
+        if len(visits) >= visits_ago:
+            return bool(visits[-visits_ago]["reward"])
+        return False
+
+    def last_visit_to_port_same_path(self, visits_ago=1):
+        """Was the Nth most recent visit to this port via the same path?"""
+        port_visits = self.previous_visits_to_port()
+        same_path_visits = self.previous_visits_same_path()
+        
+        if len(port_visits) < visits_ago:
+            return False
+        
+        # Get the visit to this port N visits ago
+        target_visit = port_visits[-visits_ago]
+        # Check if this specific port visit is in the same_path list
+        return target_visit in same_path_visits
+
+    def reward_count_last_n_trials(self, n=5):
+        """How many rewards in the last N trials (all ports)?"""
+        recent_trials = self.history[-n:] if len(self.history) >= n else self.history
+        return sum(t["reward"] for t in recent_trials)
+
+    def reward_count_last_n_port_visits(self, n=5):
+        """How many rewards in the last N visits to this port?"""
+        port_visits = self.previous_visits_to_port()
+        recent_visits = port_visits[-n:] if len(port_visits) >= n else port_visits
+        return sum(t["reward"] for t in recent_visits)
+
+
+@schema
+class HexMazeTrialHistory(dj.Computed):
+    """
+    Automatically computes choice and reward history.
+    """
+    definition = """
+    -> HexMazeBlock.Trial
+    ---
+    port_visit_1prev_rwd: bool              # if the previous visit to this port was rewarded
+    port_visit_2prev_rwd: bool              # if the second-to-last visit to this port was rewarded
+    port_visit_3prev_rwd: bool              # if the third-to-last visit to this port was rewarded
+    port_visit_1prev_same_path: bool        # if the previous visit to this port was via the same path
+    port_visit_2prev_same_path: bool        # if the second-to-last visit to this port was via the same path
+    port_visit_3prev_same_path: bool        # if the third-to-last visit to this port was via the same path
+    trial_1prev_rwd: bool                   # if the rat got a reward on the previous trial
+    trial_2prev_rwd: bool                   # if the rat got a reward 2 trials ago
+    trial_3prev_rwd: bool                   # if the rat got a reward 3 trials ago
+    trial_4prev_rwd: bool                   # if the rat got a reward 4 trials ago
+    trial_5prev_rwd: bool                   # if the rat got a reward 5 trials ago
+    """
+
+    def make(self, key):
+        # Create HexMazeTrialContext from trial key
+        trial_context = HexMazeTrialContext(key)
+
+        # Create the HexMazeTrialHistory key for this trial
+        self.insert1({
+            **key,
+            "port_visit_1prev_rwd": trial_context.last_visit_to_port_rewarded(visits_ago=1),
+            "port_visit_2prev_rwd": trial_context.last_visit_to_port_rewarded(visits_ago=2),
+            "port_visit_3prev_rwd": trial_context.last_visit_to_port_rewarded(visits_ago=3),
+            "port_visit_1prev_same_path": trial_context.last_visit_to_port_same_path(visits_ago=1),
+            "port_visit_2prev_same_path": trial_context.last_visit_to_port_same_path(visits_ago=2),
+            "port_visit_3prev_same_path": trial_context.last_visit_to_port_same_path(visits_ago=3),
+            "trial_1prev_rwd": trial_context.was_rewarded_n_trials_ago(trials_ago=1),
+            "trial_2prev_rwd": trial_context.was_rewarded_n_trials_ago(trials_ago=2),
+            "trial_3prev_rwd": trial_context.was_rewarded_n_trials_ago(trials_ago=3),
+            "trial_4prev_rwd": trial_context.was_rewarded_n_trials_ago(trials_ago=4),
+            "trial_5prev_rwd": trial_context.was_rewarded_n_trials_ago(trials_ago=5),
         })
 
 
