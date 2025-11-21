@@ -7,6 +7,7 @@ import spyglass.common as sgc
 from spyglass.common import Nwbfile, TaskEpoch, IntervalList, Session, AnalysisNwbfile
 from spyglass.position import PositionOutput
 from spyglass.utils.dj_mixin import SpyglassMixin
+import matplotlib.pyplot as plt
 
 from hexmaze import (
     get_maze_attributes, 
@@ -16,6 +17,7 @@ from hexmaze import (
     get_hexes_from_port,
     get_choice_direction,
     get_path_length_difference,
+    plot_hex_maze,
 )
 
 schema = dj.schema("hex_maze")
@@ -381,61 +383,101 @@ class HexMazeTrialContext:
         """All trials before the current one in chronological order."""
         return self.epoch_trials[:self.trial_num - 1]
 
-    def was_rewarded_n_trials_ago(self, trials_ago=1):
+    def get_trial_n_ago(self, trials_ago=1) -> dict:
+        """Return the trial dictionary for N trials ago, or None if out of bounds."""
+        idx = self.trial_num - 1 - trials_ago
+        if 0 <= idx < len(self.history):
+            return self.history[idx]
+        return None
+
+    def was_rewarded_n_trials_ago(self, trials_ago=1) -> bool:
         """Was the trial N trials ago rewarded?"""
         idx = self.trial_num - 1 - trials_ago
         if 0 <= idx < len(self.history):
             return bool(self.history[idx]["reward"])
         return False
 
-    def previous_visits_to_port(self):
+    def get_previous_visits_to_port(self) -> list[dict]:
         """All previous visits to the current trial's end port."""
         end_port = self.trial["end_port"]
         return [t for t in self.history if t["end_port"] == end_port]
 
-    def previous_visits_same_path(self):
-        """All previous trials with same start and end port as current trial."""
+    def get_previous_visits_same_path(self) -> list[dict]:
+        """All previous trials with the same start and end port as the current trial."""
         start_port = self.trial["start_port"]
         end_port = self.trial["end_port"]
         return [t for t in self.history 
                 if t["start_port"] == start_port and t["end_port"] == end_port]
 
-    def last_visit_to_port_rewarded(self, visits_ago=1):
-        """Was the Nth most recent visit to this port rewarded?"""
-        visits = self.previous_visits_to_port()
+    def get_previous_visits_alt_path(self) -> list[dict]:
+        """All previous trials with a different start port and same end port as the current trial."""
+        start_port = self.trial["start_port"]
+        end_port = self.trial["end_port"]
+        return [t for t in self.history 
+                if t["start_port"] != start_port and t["end_port"] == end_port]
+
+    def get_port_visit_n_ago(self, visits_ago=1) -> dict:
+        """Return the trial dictionary N port visits ago, or None if there are fewer than N visits."""
+        visits = self.get_previous_visits_to_port()
         if len(visits) >= visits_ago:
-            return bool(visits[-visits_ago]["reward"])
-        return False
+            return visits[-visits_ago]
+        return None
 
-    def last_visit_to_port_same_path(self, visits_ago=1):
+    def was_prev_visit_to_port_rewarded(self, visits_ago=1) -> bool:
+        """Was the Nth most recent visit to this port rewarded?"""
+        visit = self.get_port_visit_n_ago(visits_ago)
+        return bool(visit["reward"]) if visit else False
+
+    def was_prev_visit_to_port_same_path(self, visits_ago=1) -> bool:
         """Was the Nth most recent visit to this port via the same path?"""
-        port_visits = self.previous_visits_to_port()
-        same_path_visits = self.previous_visits_same_path()
-        
-        if len(port_visits) < visits_ago:
+        visit = self.get_port_visit_n_ago(visits_ago)
+        if not visit:
             return False
-        
-        # Get the visit to this port N visits ago
-        target_visit = port_visits[-visits_ago]
-        # Check if this specific port visit is in the same_path list
-        return target_visit in same_path_visits
+        return visit["start_port"] == self.trial["start_port"] and visit["end_port"] == self.trial["end_port"]
 
-    def reward_count_last_n_trials(self, n=5):
-        """How many rewards in the last N trials (all ports)?"""
+    def num_rewards_last_n_trials(self, n=10) -> int:
+        """Number of rewards in the last N trials (all ports)"""
         recent_trials = self.history[-n:] if len(self.history) >= n else self.history
         return sum(t["reward"] for t in recent_trials)
 
-    def reward_count_last_n_port_visits(self, n=5):
-        """How many rewards in the last N visits to this port?"""
-        port_visits = self.previous_visits_to_port()
+    def num_rewards_last_n_port_visits(self, n=10) -> int:
+        """Number of rewards in the last N visits to this port"""
+        port_visits = self.get_previous_visits_to_port()
         recent_visits = port_visits[-n:] if len(port_visits) >= n else port_visits
         return sum(t["reward"] for t in recent_visits)
+
+    def num_port_visits_last_n_trials(self, n=10) -> int:
+        """Number of visits to this port in the last N trials"""
+        recent_trials = self.history[-n:] if len(self.history) >= n else self.history
+        end_port = self.trial["end_port"]
+        return sum(1 for t in recent_trials if t["end_port"] == end_port)
+
+    def num_rewards_at_port_last_n_trials(self, n=10) -> int:
+        """Number of rewards at this port in the last N trials"""
+        recent_trials = self.history[-n:] if len(self.history) >= n else self.history
+        end_port = self.trial["end_port"]
+        return sum(t["reward"] for t in recent_trials if t["end_port"] == end_port)
+
+    def num_trials_since_reward(self) -> int | None:
+        """Number of trials since the last rewarded trial (all ports)"""
+        for lag, past_trial in enumerate(reversed(self.history), start=1):
+            if past_trial["reward"]:
+                return lag
+        return None  # no reward yet
+
+    def num_trials_since_port_visit(self) -> int | None:
+        """Number of trials since the last visit to this trial's end port"""
+        end_port = self.trial["end_port"]
+        for lag, past_trial in enumerate(reversed(self.history), start=1):
+            if past_trial["end_port"] == end_port:
+                return lag
+        return None  # first visit to this port
 
 
 @schema
 class HexMazeTrialHistory(dj.Computed):
     """
-    Automatically computes choice and reward history.
+    Uses HexMazeTrialContext to automatically compute a table of port choice and reward history.
     """
     definition = """
     -> HexMazeBlock.Trial
@@ -451,6 +493,8 @@ class HexMazeTrialHistory(dj.Computed):
     trial_3prev_rwd: bool                   # if the rat got a reward 3 trials ago
     trial_4prev_rwd: bool                   # if the rat got a reward 4 trials ago
     trial_5prev_rwd: bool                   # if the rat got a reward 5 trials ago
+    trials_since_port_visit: int            # number of trials since the last visit to this port
+    trials_since_rwd: int                   # number of trials since the last reward
     """
 
     def make(self, key):
@@ -460,17 +504,27 @@ class HexMazeTrialHistory(dj.Computed):
         # Create the HexMazeTrialHistory key for this trial
         self.insert1({
             **key,
-            "port_visit_1prev_rwd": trial_context.last_visit_to_port_rewarded(visits_ago=1),
-            "port_visit_2prev_rwd": trial_context.last_visit_to_port_rewarded(visits_ago=2),
-            "port_visit_3prev_rwd": trial_context.last_visit_to_port_rewarded(visits_ago=3),
-            "port_visit_1prev_same_path": trial_context.last_visit_to_port_same_path(visits_ago=1),
-            "port_visit_2prev_same_path": trial_context.last_visit_to_port_same_path(visits_ago=2),
-            "port_visit_3prev_same_path": trial_context.last_visit_to_port_same_path(visits_ago=3),
+            "port_visit_1prev_rwd": trial_context.was_prev_visit_to_port_rewarded(visits_ago=1),
+            "port_visit_2prev_rwd": trial_context.was_prev_visit_to_port_rewarded(visits_ago=2),
+            "port_visit_3prev_rwd": trial_context.was_prev_visit_to_port_rewarded(visits_ago=3),
+            "port_visit_1prev_same_path": trial_context.was_prev_visit_to_port_same_path(visits_ago=1),
+            "port_visit_2prev_same_path": trial_context.was_prev_visit_to_port_same_path(visits_ago=2),
+            "port_visit_3prev_same_path": trial_context.was_prev_visit_to_port_same_path(visits_ago=3),
             "trial_1prev_rwd": trial_context.was_rewarded_n_trials_ago(trials_ago=1),
             "trial_2prev_rwd": trial_context.was_rewarded_n_trials_ago(trials_ago=2),
             "trial_3prev_rwd": trial_context.was_rewarded_n_trials_ago(trials_ago=3),
             "trial_4prev_rwd": trial_context.was_rewarded_n_trials_ago(trials_ago=4),
             "trial_5prev_rwd": trial_context.was_rewarded_n_trials_ago(trials_ago=5),
+            "trials_since_port_visit": (
+                trial_context.num_trials_since_port_visit()
+                if trial_context.num_trials_since_port_visit() is not None
+                else -1
+            ),
+            "trials_since_rwd": (
+                trial_context.num_trials_since_reward()
+                if trial_context.num_trials_since_reward() is not None
+                else -1
+            ),
         })
 
 
@@ -932,11 +986,6 @@ class HexPath(SpyglassMixin, dj.Computed):
                 for h in hexes
             }
             hex_path["hex_type"] = hex_path["hex"].map(hex_to_type)
-            # Mark choice points
-            hex_path["hex_type"] = hex_path.apply(
-                lambda row: "choice_point" if row["hex"] in critical_choice_points else row["hex_type"],
-                axis=1
-            )
 
             # Map each hex to the section of the maze it's in (1, 2, or 3 for near port A, B, or C)
             thirds = divide_into_thirds(maze)
@@ -958,13 +1007,17 @@ class HexPath(SpyglassMixin, dj.Computed):
             # Assign maze section label for each hex (if no label, e.g. first section of first trial, it will be "None")
             hex_path["maze_portion"] = hex_path["hex"].map(lambda h: label.get(hex_to_maze_third.get(h))).astype("str")
 
-            # Add trial number and block columns
-            hex_path["block_trial_num"] = trial["block_trial_num"]
+            # Add block/trial key columns for ease of combination later
+            hex_path["nwb_file_name"] = trial["nwb_file_name"]
+            hex_path["epoch"] = trial["epoch"]
             hex_path["block"] = trial["block"]
-            # Put the trial and block columns on the left
-            hex_path = hex_path[["block", "block_trial_num"] + 
-                                [c for c in hex_path.columns if c not in {"block", "block_trial_num"}]]
-            
+            hex_path["block_trial_num"] = trial["block_trial_num"]
+            hex_path["epoch_trial_num"] = trial["epoch_trial_num"]
+            # Put the key columns on the left
+            hex_path = hex_path[["nwb_file_name", "epoch", "block", "block_trial_num", "epoch_trial_num"] + 
+                                [c for c in hex_path.columns 
+                                 if c not in {"nwb_file_name", "epoch", "block", "block_trial_num", "epoch_trial_num"}]]
+
             # Add the hex path for this trial
             all_hex_paths.append(hex_path)
 
@@ -1022,3 +1075,44 @@ class HexPath(SpyglassMixin, dj.Computed):
                 df = df[df["block_trial_num"] == block_trial_num]
                 
         return df.reset_index(drop=True)
+
+
+    def plot_trial(self, block, block_trial_num, ax=None):
+        """Plot a single trial's trajectory on the hex maze."""
+
+        # Fetch the hex path for this trial
+        df = self.fetch_trial(block, block_trial_num)
+        if df.empty:
+            raise ValueError(f"No hex path found for block {block}, trial {block_trial_num}")
+        hex_path = df["hex"].tolist()
+
+        # Fetch the key for this HexPath entry
+        key = self.fetch1("KEY")   # contains nwb_file_name + epoch
+
+        # Fetch maze config for the given block in this epoch
+        maze_config = (HexMazeBlock() & {
+            "nwb_file_name": key["nwb_file_name"],
+            "epoch": key["epoch"],
+            "block": block,
+        }).fetch1("config_id")
+        
+        # Create figure if no axis provided
+        created_fig = False
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(8, 6))
+            created_fig = True
+
+        plot_hex_maze(
+            barriers=maze_config,
+            ax=ax,
+            hex_path=hex_path,
+            show_barriers=False,
+            show_choice_points=False,
+            show_hex_labels=False,
+        )
+        ax.set_title(f"Hex path: Block {block}, Trial {block_trial_num}")
+
+        if created_fig:
+            plt.tight_layout()
+            plt.show()
+        return ax
