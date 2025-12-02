@@ -16,7 +16,7 @@ from hexmaze import (
     classify_maze_hexes, 
     get_hexes_from_port,
     get_choice_direction,
-    get_path_length_difference,
+    get_reward_path_lengths,
     plot_hex_maze,
 )
 
@@ -25,10 +25,10 @@ schema = dj.schema("hex_maze")
 def populate_all_hexmaze(nwb_file_name):
     """
     Populate basic hex maze tables for a given NWB file:
-    HexMazeBlock, HexMazeBlock.Trial, HexMazeChoice, HexCentroids, HexMazeConfig
+    HexMazeBlock, HexMazeBlock.Trial, HexMazeChoice, HexMazeTrialHistory, HexCentroids, HexMazeConfig
     """
 
-    # Populate the HexMazeBlock table, Trial part table, HexMazeChoice, and HexMazeConfig table
+    # Populate the HexMazeBlock table, Trial part table, HexMazeChoice, HexMazeTrialHistory, and HexMazeConfig table
     HexMazeBlock().load_from_nwb(nwb_file_name)
     # Populate the HexCentroids table
     HexCentroids.populate({'nwb_file_name': nwb_file_name})
@@ -298,75 +298,116 @@ class HexMazeBlock(SpyglassMixin, dj.Manual):
 
 
 @schema
-class HexMazeChoice(dj.Computed):
+class HexMazeChoice(SpyglassMixin, dj.Computed):
     """
-    Automatically computes choice direction, reward probability difference, 
-    and path length difference for each entry in HexMazeBlock.Trial.
-    The first trial of each epoch is excluded because there is no start_port.
+    Automatically computes choice direction, chosen reward probability, chosen path length,
+    reward probability difference, and path length difference for each entry in HexMazeBlock.Trial.
+    The first trial of each epoch is excluded because there is no start_port so most fields are not defined.
     """
     definition = """
     -> HexMazeBlock.Trial
     ---
     choice_direction: varchar(16)   # 'left' or 'right'
-    reward_prob_diff: float         # reward probability difference
-    path_length_diff: float         # path length difference
+    reward_prob_chosen: float       # chosen reward probability
+    reward_prob_unchosen: float     # unchosen reward probability
+    reward_prob_diff: float         # p(chosen) - p(unchosen)
+    path_length_chosen: int         # length of the chosen path
+    path_length_unchosen: int       # length of the unchosen path
+    path_length_diff: int           # chosen path length - unchosen path length
     """
 
     @staticmethod
-    def get_reward_prob_difference(trial_row) -> float:
+    def get_reward_probs(trial_row):
         """
-        Helper to compute the reward probability difference for a trial row.
+        Helper to get chosen and unchosen reward probabilities for a trial row.
 
         Parameters:
             trial_row (dict or DataFrame row): must contain keys:
                 'p_a', 'p_b', 'p_c', 'start_port', 'end_port'
 
         Returns:
-            float: p(chosen) - p(unchosen)
+            p(chosen), p(unchosen)
         """
-        pa, pb, pc = trial_row['p_a'], trial_row['p_b'], trial_row['p_c']
-        start_port = trial_row['start_port']
-        end_port = trial_row['end_port']
+        # Get start port, end port, and unchosen port for this trial
+        start_port = trial_row["start_port"]
+        end_port = trial_row["end_port"]
+        unchosen_port = ({"A", "B", "C"} - {start_port, end_port}).pop()
+        
+        # Get reward probabilities at each port
+        port_probs = {
+            "A": trial_row["p_a"],
+            "B": trial_row["p_b"],
+            "C": trial_row["p_c"],
+        }
 
-        port_probs = {"A": pa, "B": pb, "C": pc}
-
+        # Get chosen and unchosen reward probabilities
         chosen_prob = port_probs[end_port]
-        unchosen_port = ({'A', 'B', 'C'} - {start_port, end_port}).pop()
         unchosen_prob = port_probs[unchosen_port]
+        return chosen_prob, unchosen_prob
 
-        return chosen_prob - unchosen_prob
+    @staticmethod
+    def get_path_lengths(trial_row):
+        """
+        Helper to get chosen and unchosen path lengths for a trial row.
+
+        Parameters:
+            trial_row (dict or DataFrame row): must contain keys:
+                'config_id', 'start_port', 'end_port'
+
+        Returns:
+            chosen_length, unchosen_length
+        """
+        # Get start port, end port, and unchosen port for this trial
+        start_port = trial_row["start_port"]
+        end_port = trial_row["end_port"]
+        unchosen_port = ({"A", "B", "C"} - {start_port, end_port}).pop()
+
+        # Get reward path lengths for this maze
+        maze = trial_row["config_id"]
+        len_AB, len_AC, len_BC = get_reward_path_lengths(maze)
+        path_lengths = {
+            frozenset(("A", "B")): len_AB,
+            frozenset(("A", "C")): len_AC,
+            frozenset(("B", "C")): len_BC,
+        }
+
+        # Get chosen and unchosen reward path lengths
+        chosen_length = path_lengths[frozenset((start_port, end_port))]
+        unchosen_length = path_lengths[frozenset((start_port, unchosen_port))]
+        return chosen_length, unchosen_length
 
 
     def make(self, key):
         # Fetch the block + trial row
         trial_row = (HexMazeBlock().join_with_trial() & key).fetch1()
-        
+
         # Skip this trial if start_port is None (first trial of the epoch)
         if trial_row['start_port'] == 'None':
             return
 
-        maze = trial_row['config_id']
-        start_port = trial_row['start_port']
-        end_port = trial_row['end_port']
-
         # Compute choice features
-        choice_direction = get_choice_direction(start_port, end_port)
-        reward_prob_diff= self.get_reward_prob_difference(trial_row)
-        path_length_diff = get_path_length_difference(maze, start_port, end_port)
+        choice_direction = get_choice_direction(trial_row['start_port'], trial_row['end_port'])
+        chosen_prob, unchosen_prob = self.get_reward_probs(trial_row)
+        chosen_length, unchosen_length = self.get_path_lengths(trial_row)
 
         # Insert features
         self.insert1({
             **key,
             'choice_direction': choice_direction,
-            'reward_prob_diff': reward_prob_diff,
-            'path_length_diff': path_length_diff
+            'reward_prob_chosen': chosen_prob,
+            'reward_prob_unchosen': unchosen_prob,
+            'reward_prob_diff': chosen_prob-unchosen_prob,
+            'path_length_chosen': chosen_length,
+            'path_length_unchosen': unchosen_length,
+            'path_length_diff': chosen_length-unchosen_length,
         })
 
 
 class HexMazeTrialContext:
     """
-    Context for analyzing a single trial's history within its epoch.
-    Initialize with a trial key, automatically loads epoch history.
+    Helper class for analyzing a single trial's history within its epoch.
+    Initialize with a trial key (e.g. trial_context = HexMazeTrialContext(trial_key)).
+    This allows you to query a trial about its reward and port/path choice history.
     """
 
     def __init__(self, trial_key):
@@ -475,9 +516,10 @@ class HexMazeTrialContext:
 
 
 @schema
-class HexMazeTrialHistory(dj.Computed):
+class HexMazeTrialHistory(SpyglassMixin, dj.Computed):
     """
     Uses HexMazeTrialContext to automatically compute a table of port choice and reward history.
+    Useful for filtering the HexMazeBlock.Trial table to trials with certain reward/choice histories.
     """
     definition = """
     -> HexMazeBlock.Trial
