@@ -37,7 +37,7 @@ def populate_all_hexmaze(nwb_file_name):
 def populate_all_hex_position():
     """
     Find all valid HexPositionSelection keys, insert them into 
-    the HexPositionSelection table, and populate HexPosition.
+    the HexPositionSelection table, and populate HexPosition and HexPath.
     """
 
     # Get all valid keys that can be used to populate the HexPositionSelection table
@@ -57,13 +57,14 @@ def populate_all_hex_position():
         except Exception as e:
             print(f"Skipping insert for {selection_key}: {e}")
 
-    # Populate HexPosition table
+    # Populate HexPosition table and HexPath table
     HexPosition.populate()
+    HexPath.populate()
 
 
 def populate_hex_position(nwb_file_name):
     """
-    Populate the HexPositionSelection and HexPosition tables for a given nwb_file_name.
+    Populate the HexPositionSelection, HexPosition, and HexPath tables for a given nwb_file_name.
     """
     # Get all valid keys for the that HexPositionSelection table for this nwb
     all_valid_keys = HexPositionSelection.get_all_valid_keys(verbose=False)
@@ -91,6 +92,9 @@ def populate_hex_position(nwb_file_name):
     selection_keys = (HexPositionSelection & {"nwb_file_name": nwb_file_name}).fetch("KEY")
     print(f"Populating HexPosition for {len(selection_keys)} entries in {nwb_file_name}")
     HexPosition.populate(selection_keys)
+    
+    # Also populate HexPath for this nwb
+    HexPath.populate(selection_keys)
 
 
 @schema
@@ -1119,7 +1123,7 @@ class HexPath(SpyglassMixin, dj.Computed):
         return df.reset_index(drop=True)
 
 
-    def plot_trial(self, block, block_trial_num, ax=None):
+    def plot_trial(self, block, block_trial_num, ax=None, show_stats=True):
         """Plot a single trial's trajectory on the hex maze."""
 
         # Fetch the hex path for this trial
@@ -1132,18 +1136,26 @@ class HexPath(SpyglassMixin, dj.Computed):
         key = self.fetch1("KEY")   # contains nwb_file_name + epoch
 
         # Fetch maze config for the given block in this epoch
-        maze_config = (HexMazeBlock() & {
+        block_entry = HexMazeBlock() & {
             "nwb_file_name": key["nwb_file_name"],
             "epoch": key["epoch"],
             "block": block,
-        }).fetch1("config_id")
-        
+        }
+        maze_config = block_entry.fetch1("config_id")
+
+        if show_stats:
+            reward_probs = [int(block_entry.fetch1(f"p_{x}")) for x in ["a", "b", "c"]]
+        else:
+            reward_probs = None
+
         # Create figure if no axis provided
         created_fig = False
         if ax is None:
             fig, ax = plt.subplots(figsize=(8, 6))
             created_fig = True
 
+        # Plot the maze with the hex path
+        # If show_stats, add path lengths and reward probabilities
         plot_hex_maze(
             barriers=maze_config,
             ax=ax,
@@ -1151,10 +1163,84 @@ class HexPath(SpyglassMixin, dj.Computed):
             show_barriers=False,
             show_choice_points=False,
             show_hex_labels=False,
+            show_stats=show_stats,
+            reward_probabilities=reward_probs,
         )
-        ax.set_title(f"Hex path: Block {block}, Trial {block_trial_num}")
+        ax.set_title(f"Block {block}, Trial {block_trial_num}")
 
         if created_fig:
             plt.tight_layout()
             plt.show()
         return ax
+
+
+    def plot_block(self, block, trials=None, show_stats=True):
+        """Plot trial trajectories for all trials in a block on the hex maze."""
+
+        # Fetch all trial paths for the block at once
+        df_block = self.fetch_block(block)
+        if df_block.empty:
+            raise ValueError(f"No hex path found for block {block}")
+
+        if trials is None:
+            trials = sorted(df_block["block_trial_num"].unique())
+
+        num_trials = len(trials)
+
+        # Fetch block info
+        key = self.fetch1("KEY")  # contains nwb_file_name + epoch
+        nwb_file, epoch = key["nwb_file_name"], key["epoch"]
+
+        # Fetch maze config and reward probabilities for this block
+        block_entry = HexMazeBlock() & {
+            "nwb_file_name": nwb_file,
+            "epoch": epoch,
+            "block": block,
+        }
+        maze_config = block_entry.fetch1("config_id")
+        if show_stats:
+            reward_probs = [int(block_entry.fetch1(f"p_{x}")) for x in ["a", "b", "c"]]
+        else:
+            reward_probs = None
+
+        # Determine square-ish grid
+        ncols = int(np.ceil(np.sqrt(num_trials)))
+        nrows = int(np.ceil(num_trials / ncols))
+        fig, axes = plt.subplots(nrows, ncols, figsize=(3*ncols, 3*nrows))
+
+        # Make sure axes is 1D so flatten doesn't break
+        if isinstance(axes, plt.Axes):
+            axes = np.array([axes])
+        else:
+            axes = np.array(axes).flatten()
+
+        # Big title
+        fig.suptitle(f"{nwb_file} epoch {epoch}, block {block}", fontsize=20, y=1.02)
+
+        # Loop over trials and plot hex path for each one
+        for i, tri_num in enumerate(trials):
+            df_trial = df_block[df_block["block_trial_num"] == tri_num]
+            if df_trial.empty:
+                raise ValueError(f"No hex path found for block {block}, trial {tri_num}")
+            hex_path = df_trial["hex"].tolist()
+
+            plot_hex_maze(
+                barriers=maze_config,
+                ax=axes[i],
+                hex_path=hex_path,
+                show_barriers=False,
+                show_choice_points=False,
+                show_hex_labels=False,
+                show_stats=show_stats,
+                reward_probabilities=reward_probs,
+            )
+            axes[i].set_title(f"Trial {tri_num}")
+
+        # Hide unused axes
+        for j in range(num_trials, len(axes)):
+            axes[j].axis('off')
+
+        plt.tight_layout()
+        plt.show()
+
+        return axes
