@@ -37,7 +37,7 @@ def populate_all_hexmaze(nwb_file_name):
 def populate_all_hex_position():
     """
     Find all valid HexPositionSelection keys, insert them into 
-    the HexPositionSelection table, and populate HexPosition.
+    the HexPositionSelection table, and populate HexPosition and HexPath.
     """
 
     # Get all valid keys that can be used to populate the HexPositionSelection table
@@ -57,13 +57,14 @@ def populate_all_hex_position():
         except Exception as e:
             print(f"Skipping insert for {selection_key}: {e}")
 
-    # Populate HexPosition table
+    # Populate HexPosition table and HexPath table
     HexPosition.populate()
+    HexPath.populate()
 
 
 def populate_hex_position(nwb_file_name):
     """
-    Populate the HexPositionSelection and HexPosition tables for a given nwb_file_name.
+    Populate the HexPositionSelection, HexPosition, and HexPath tables for a given nwb_file_name.
     """
     # Get all valid keys for the that HexPositionSelection table for this nwb
     all_valid_keys = HexPositionSelection.get_all_valid_keys(verbose=False)
@@ -91,6 +92,9 @@ def populate_hex_position(nwb_file_name):
     selection_keys = (HexPositionSelection & {"nwb_file_name": nwb_file_name}).fetch("KEY")
     print(f"Populating HexPosition for {len(selection_keys)} entries in {nwb_file_name}")
     HexPosition.populate(selection_keys)
+    
+    # Also populate HexPath for this nwb
+    HexPath.populate(selection_keys)
 
 
 @schema
