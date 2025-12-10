@@ -2,9 +2,19 @@ import re
 import numpy as np
 import pandas as pd
 import datajoint as dj
-from spyglass.common import Nwbfile, TaskEpoch, IntervalList, Session, AnalysisNwbfile
+from spyglass.common import Nwbfile, TaskEpoch, IntervalList, Session
+from spyglass.common.custom_nwbfile import AnalysisNwbfile
 from spyglass.decoding.decoding_merge import DecodingOutput
 from spyglass.utils.dj_mixin import SpyglassMixin
+import matplotlib.pyplot as plt
+
+from hexmaze import (
+    get_critical_choice_points, 
+    divide_into_thirds, 
+    classify_maze_hexes, 
+    get_hexes_from_port,
+    plot_hex_maze,
+)
 
 from hex_maze_behavior import HexCentroids, HexMazeBlock
 
@@ -286,3 +296,304 @@ class DecodedHexPosition(SpyglassMixin, dj.Computed):
         full_position_df  = full_position_df.loc[mask]
 
         return full_position_df
+
+
+@schema
+class DecodedHexPath(SpyglassMixin, dj.Computed):
+    """
+    Stores each hex transition within a trial, including entry/exit times,
+    maze component, and distance to/from ports.
+    """
+
+    definition = """
+    -> DecodedHexPosition
+    ---
+    -> AnalysisNwbfile
+    hex_path_object_id: varchar(128)
+    """
+
+    def make(self, key):
+        # Get hex position dataframe for this nwb+epoch
+        hex_position_df = (DecodedHexPosition & key).fetch1_dataframe()
+
+        # Get trials for this nwb+epoch
+        trials = (HexMazeBlock().Trial() & {"nwb_file_name": key["nwb_file_name"], "epoch": key["epoch"]})
+        
+        # Accumulate per-trial dataframes
+        all_hex_paths = []
+
+        for trial in trials:
+            # Get trial time bounds
+            trial_start, trial_end = (IntervalList & {
+                'nwb_file_name': trial["nwb_file_name"],
+                'interval_list_name': trial['interval_list_name']
+            }).fetch1('valid_times')[0]
+
+            # Get maze configuration and attributes
+            maze = (HexMazeBlock() & {
+                'nwb_file_name': trial['nwb_file_name'], 
+                'block': trial['block'],
+                'epoch': trial['epoch']
+            }).fetch1('config_id')
+            critical_choice_points = get_critical_choice_points(maze)
+            hex_type_dict = classify_maze_hexes(maze)
+
+            # Filter decoded position data to this trial
+            trial_mask = (hex_position_df.index >= trial_start) & (hex_position_df.index <= trial_end)
+            trial_position_df = hex_position_df.loc[trial_mask].copy()
+
+            # Identify contiguous hex segments
+            trial_position_df["segment"] = (trial_position_df["hex"] != trial_position_df["hex"].shift()).cumsum()
+
+            # Set up dataframe of hex entries for this trial
+            hex_path = (
+                trial_position_df.groupby("segment")
+                .agg(
+                    hex=("hex", "first"),
+                    entry_time=("hex", lambda x: x.index[0]),
+                    exit_time=("hex", lambda x: x.index[-1]),
+                )
+                .reset_index(drop=True)
+            )
+
+            # Time spent in each hex
+            hex_path["duration"] = hex_path["exit_time"] - hex_path["entry_time"]
+
+            # What number hex entry in the trial this is
+            hex_path["hex_in_trial"] = range(1, len(hex_path) + 1)
+
+            # Count the number of times the rat has entered this specific hex in this trial
+            hex_path["hex_entry_num"] = hex_path.groupby("hex").cumcount() + 1
+
+            # For each hex, compute distances to start and end port
+            if trial["start_port"] == "None": # first trial does not have a start port, so we just fill with -1
+                hex_path["hexes_from_start"] = [-1] * len(hex_path)
+            else:
+                hex_path["hexes_from_start"] = [
+                    get_hexes_from_port(maze, start_hex=h, reward_port=trial["start_port"])
+                    for h in hex_path["hex"]
+                ]
+            hex_path["hexes_from_end"] = [
+                get_hexes_from_port(maze, start_hex=h, reward_port=trial["end_port"])
+                for h in hex_path["hex"]
+            ]
+
+            # Classify each hex as optimal, non-optimal, or dead-end
+            hex_to_type = {
+                h: group_name.replace("_hexes", "")
+                for group_name, hexes in hex_type_dict.items()
+                if group_name in {"optimal_hexes", "non_optimal_hexes", "dead_end_hexes"}
+                for h in hexes
+            }
+            hex_path["hex_type"] = hex_path["hex"].map(hex_to_type)
+
+            # Map each hex to the section of the maze it's in (1, 2, or 3 for near port A, B, or C)
+            thirds = divide_into_thirds(maze)
+            hex_to_maze_third = {h: third_num for third_num, hexes in enumerate(thirds, start=1) for h in hexes}
+            # Map choice points to section 0
+            hex_to_maze_third.update({h: 0 for h in critical_choice_points})
+
+            # Identify the maze sections as 'start', 'chosen', or 'unchosen'
+            # Note that for the first trial, start_port is None so start_section and unchosen_section will both be None
+            port_map = {"A": 1, "B": 2, "C": 3}
+            start_section  = port_map.get(trial["start_port"])
+            chosen_section = port_map.get(trial["end_port"])
+            unchosen_section = {1, 2, 3} - {chosen_section} - {start_section}
+            unchosen_section = unchosen_section.pop() if len(unchosen_section) == 1 else None
+
+            # Map maze section number to its label 
+            label = {start_section: "start", chosen_section: "chosen", unchosen_section: "unchosen", 0: "choice_point"}
+
+            # Assign maze section label for each hex (if no label, e.g. first section of first trial, it will be "None")
+            hex_path["maze_portion"] = hex_path["hex"].map(lambda h: label.get(hex_to_maze_third.get(h))).astype("str")
+
+            # Add block/trial key columns for ease of combination later
+            hex_path["nwb_file_name"] = trial["nwb_file_name"]
+            hex_path["epoch"] = trial["epoch"]
+            hex_path["block"] = trial["block"]
+            hex_path["block_trial_num"] = trial["block_trial_num"]
+            hex_path["epoch_trial_num"] = trial["epoch_trial_num"]
+            # Put the key columns on the left
+            hex_path = hex_path[["nwb_file_name", "epoch", "block", "block_trial_num", "epoch_trial_num"] + 
+                                [c for c in hex_path.columns 
+                                 if c not in {"nwb_file_name", "epoch", "block", "block_trial_num", "epoch_trial_num"}]]
+
+            # Add the hex path for this trial
+            all_hex_paths.append(hex_path)
+
+        # Concatenate per-trial dataframes into one big dataframe
+        hex_path_all_trials = pd.concat(all_hex_paths, ignore_index=True)
+
+        # Create an empty AnalysisNwbfile with a link to the original nwb
+        analysis_file_name = AnalysisNwbfile().create(key["nwb_file_name"])
+        # Store the name of this newly created AnalysisNwbfile 
+        key["analysis_file_name"] = analysis_file_name
+        # Add the hex path dataframe to the AnalysisNwbfile 
+        key["hex_path_object_id"] = AnalysisNwbfile().add_nwb_object(
+            analysis_file_name, hex_path_all_trials, "hex_path"
+        )
+        # Create an entry in the AnalysisNwbfile table (like insert1)
+        AnalysisNwbfile().add(key["nwb_file_name"], key["analysis_file_name"])
+        self.insert1(key)
+
+
+    def fetch1_dataframe(self):
+        return self.fetch_nwb()[0]["hex_path"]
+
+
+    def fetch_block(self, block):
+        """Return hex_path rows for a specific block."""
+        df = self.fetch1_dataframe()
+        df_block = df[df["block"] == block]
+        return df_block.reset_index(drop=True)
+
+
+    def fetch_trial(self, block, block_trial_num):
+        """Return hex_path rows for a specific trial within a block."""
+        df = self.fetch1_dataframe()
+        df_trial = df[
+            (df["block"] == block) &
+            (df["block_trial_num"] == block_trial_num)
+        ]
+        return df_trial.reset_index(drop=True)
+
+    def fetch_trials(self, block=None, block_trial_num=None):
+        """Return hex_path rows optionally filtered to specific blocks or trials"""
+        df = self.fetch1_dataframe()
+        
+        if block is not None:
+            if isinstance(block, (list, tuple, set)):
+                df = df[df["block"].isin(block)]
+            else:
+                df = df[df["block"] == block]
+
+        if block_trial_num is not None:
+            if isinstance(block_trial_num, (list, tuple, set)):
+                df = df[df["block_trial_num"].isin(block_trial_num)]
+            else:
+                df = df[df["block_trial_num"] == block_trial_num]
+                
+        return df.reset_index(drop=True)
+
+
+    def plot_trial(self, block, block_trial_num, ax=None, show_stats=True):
+        """Plot a single trial's trajectory on the hex maze."""
+
+        # Fetch the hex path for this trial
+        df = self.fetch_trial(block, block_trial_num)
+        if df.empty:
+            raise ValueError(f"No hex path found for block {block}, trial {block_trial_num}")
+        hex_path = df["hex"].tolist()
+
+        # Fetch the key for this HexPath entry
+        key = self.fetch1("KEY")   # contains nwb_file_name + epoch
+
+        # Fetch maze config for the given block in this epoch
+        block_entry = HexMazeBlock() & {
+            "nwb_file_name": key["nwb_file_name"],
+            "epoch": key["epoch"],
+            "block": block,
+        }
+        maze_config = block_entry.fetch1("config_id")
+
+        if show_stats:
+            reward_probs = [int(block_entry.fetch1(f"p_{x}")) for x in ["a", "b", "c"]]
+        else:
+            reward_probs = None
+
+        # Create figure if no axis provided
+        created_fig = False
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(8, 6))
+            created_fig = True
+
+        # Plot the maze with the hex path
+        # If show_stats, add path lengths and reward probabilities
+        plot_hex_maze(
+            barriers=maze_config,
+            ax=ax,
+            hex_path=hex_path,
+            show_barriers=False,
+            show_choice_points=False,
+            show_hex_labels=False,
+            show_stats=show_stats,
+            reward_probabilities=reward_probs,
+        )
+        ax.set_title(f"Block {block}, Trial {block_trial_num}")
+
+        if created_fig:
+            plt.tight_layout()
+            plt.show()
+        return ax
+
+
+    def plot_block(self, block, trials=None, show_stats=True):
+        """Plot trial trajectories for all trials in a block on the hex maze."""
+
+        # Fetch all trial paths for the block at once
+        df_block = self.fetch_block(block)
+        if df_block.empty:
+            raise ValueError(f"No hex path found for block {block}")
+
+        if trials is None:
+            trials = sorted(df_block["block_trial_num"].unique())
+
+        num_trials = len(trials)
+
+        # Fetch block info
+        key = self.fetch1("KEY")  # contains nwb_file_name + epoch
+        nwb_file, epoch = key["nwb_file_name"], key["epoch"]
+
+        # Fetch maze config and reward probabilities for this block
+        block_entry = HexMazeBlock() & {
+            "nwb_file_name": nwb_file,
+            "epoch": epoch,
+            "block": block,
+        }
+        maze_config = block_entry.fetch1("config_id")
+        if show_stats:
+            reward_probs = [int(block_entry.fetch1(f"p_{x}")) for x in ["a", "b", "c"]]
+        else:
+            reward_probs = None
+
+        # Determine square-ish grid
+        ncols = int(np.ceil(np.sqrt(num_trials)))
+        nrows = int(np.ceil(num_trials / ncols))
+        fig, axes = plt.subplots(nrows, ncols, figsize=(3*ncols, 3*nrows))
+
+        # Make sure axes is 1D so flatten doesn't break
+        if isinstance(axes, plt.Axes):
+            axes = np.array([axes])
+        else:
+            axes = np.array(axes).flatten()
+
+        # Big title
+        fig.suptitle(f"{nwb_file} epoch {epoch}, block {block}", fontsize=20, y=1.02)
+
+        # Loop over trials and plot hex path for each one
+        for i, tri_num in enumerate(trials):
+            df_trial = df_block[df_block["block_trial_num"] == tri_num]
+            if df_trial.empty:
+                raise ValueError(f"No hex path found for block {block}, trial {tri_num}")
+            hex_path = df_trial["hex"].tolist()
+
+            plot_hex_maze(
+                barriers=maze_config,
+                ax=axes[i],
+                hex_path=hex_path,
+                show_barriers=False,
+                show_choice_points=False,
+                show_hex_labels=False,
+                show_stats=show_stats,
+                reward_probabilities=reward_probs,
+            )
+            axes[i].set_title(f"Trial {tri_num}")
+
+        # Hide unused axes
+        for j in range(num_trials, len(axes)):
+            axes[j].axis('off')
+
+        plt.tight_layout()
+        plt.show()
+
+        return axes
