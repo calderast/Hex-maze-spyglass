@@ -9,8 +9,8 @@ from non_local_detector.model_checking import (
     get_highest_posterior_threshold,
     get_HPD_spatial_coverage,
 )
-from spyglass.common import IntervalList
-from spyglass.common.custom_nwbfile import AnalysisNwbfile
+from spyglass.common import Nwbfile, TaskEpoch, IntervalList, Session, AnalysisNwbfile
+from spyglass.common.custom_nwbfile import AnalysisNwbfile as custom_AnalysisNwbfile
 from spyglass.decoding.decoding_merge import DecodingOutput
 from spyglass.utils import SpyglassMixin, logger
 
@@ -365,9 +365,11 @@ class DecodedHexPath(SpyglassMixin, dj.Computed):
     definition = """
     -> DecodedHexPosition
     ---
-    -> AnalysisNwbfile
+    -> custom_AnalysisNwbfile
     hex_path_object_id: varchar(128)
     """
+
+    _nwb_table = custom_AnalysisNwbfile() 
 
     def make(self, key):
         # Get hex position dataframe for this nwb+epoch
@@ -533,15 +535,13 @@ class DecodedHexPath(SpyglassMixin, dj.Computed):
         hex_path_all_trials = pd.concat(all_hex_paths, ignore_index=True)
 
         # Create an empty AnalysisNwbfile with a link to the original nwb
-        analysis_file_name = AnalysisNwbfile().create(key["nwb_file_name"])
-        # Store the name of this newly created AnalysisNwbfile
-        key["analysis_file_name"] = analysis_file_name
-        # Add the hex path dataframe to the AnalysisNwbfile
-        key["hex_path_object_id"] = AnalysisNwbfile().add_nwb_object(
-            analysis_file_name, hex_path_all_trials, "hex_path"
-        )
-        # Create an entry in the AnalysisNwbfile table (like insert1)
-        AnalysisNwbfile().add(key["nwb_file_name"], key["analysis_file_name"])
+        with custom_AnalysisNwbfile().build(key["nwb_file_name"]) as builder:
+            # Add the hex path dataframe to the AnalysisNwbfile
+            key["hex_path_object_id"] = builder.add_nwb_object(hex_path_all_trials, "hex_path")
+
+            # File automatically registered on exit!
+            key["analysis_file_name"] = builder.analysis_file_name
+
         self.insert1(key)
 
     def fetch1_dataframe(self):
