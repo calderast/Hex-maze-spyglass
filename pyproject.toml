@@ -33,7 +33,7 @@ dependencies = [
     "spyglass-neuro",
     "hex-maze-neuro",
     "non-local-detector>=0.6.9",
-    "ndx-fiber-photometry @ git+ssh://git@github.com/catalystneuro/ndx-fiber-photometry",
+    "ndx-fiber-photometry==0.1.0",
     "ndx-ophys-devices"
 ]
 
