@@ -21,6 +21,10 @@ Note that this package depends on the CatalystNeuro fork of
 pip install git+https://github.com/catalystneuro/ndx-fiber-photometry.git
 ```
 
+Note that this package is not currently seamlessly compatible with the
+Spyglass due to `hex-maze-neuro`'s pin of networkx>=3.3, which is Python 3.10
+only. Spyglass depends on a handful of packages limited to Python 3.9.
+
 ## Usage
 
 ### Tables
