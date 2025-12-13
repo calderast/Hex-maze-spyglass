@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spyglass-hexmaze"
+version = "0.1.0"
+description = "Spyglass extension for hex maze behavioral and neural analysis"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Stephanie Crater"},
+]
+keywords = ["neuroscience", "datajoint", "spyglass", "behavior", "decoding"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "numpy",
+    "pandas",
+    "matplotlib",
+    "datajoint",
+    "pynwb",
+    "spyglass-neuro>=0.5.4",
+    "hex-maze-neuro",
+    "non-local-detector>=0.6.9",
+    "ndx-fiber-photometry==0.1.0",
+    "ndx-ophys-devices"
+]
+
+[project.optional-dependencies]
+dev = [
+    "jupyter",
+    "ipykernel",
+]
+
+[project.urls]
+Homepage = "https://github.com/calderast/Hex-maze-spyglass"
+Repository = "https://github.com/calderast/Hex-maze-spyglass"
+Issues = "https://github.com/calderast/Hex-maze-spyglass/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["spyglass_hexmaze*"]
+exclude = ["tests*", "docs*", "dev*", "decoding*"]
