@@ -27,8 +27,8 @@ This package provides three main modules:
 #### Hex Maze Behavior (`hex_maze_behavior`)
 
 - `HexMazeConfig` (Manual) - Hex maze configurations defining barrier
-    placements and optimal path lengths between ports
-- `HexMazeBlock` (Manual) - Blocks in the hex maze task, each with reward
+    placements and maze attributes (optimal path lengths between ports, etc)
+- `HexMazeBlock` (Manual) - Blocks in the hex maze task, each with maze configuration and reward
     probabilities at ports A, B, C
 - `HexMazeBlock.Trial` (Part) - Individual trials within each block,
     including start/end ports and trial outcomes
@@ -36,10 +36,13 @@ This package provides three main modules:
     length differences for each trial
 - `HexMazeTrialHistory` (Computed) - Trial history information for behavioral
     analysis
-- `HexPositionSelection` (Manual) - Selection table linking position data to
+- `HexCentroids` (Imported) - Hex centroids for each session, used for assigning position to hex
+- `HexPositionSelection` (Manual) - Selection table linking position data to hex centroids and
     hex maze epochs
-- `HexPosition` (Computed) - Processed position data aligned to hex centroids
-- `HexPath` (Computed) - Trajectory paths through the hex maze
+- `HexPosition` (Computed) - Processed position data assigned to hex centroids
+- `HexPath` (Computed) - Rat trajectories through the hex maze by trial, and associated hex-level path information
+
+Helper class `HexMazeTrialContext` also takes a trial key and provides a number of helper functions to analyze the trial in context
 
 #### Decoding (`hex_maze_decoding`)
 
@@ -58,10 +61,9 @@ This package provides three main modules:
 - `FiberPhotometrySeries` (Manual) - Time series data from fiber photometry
     recordings
 
-### Populator
+### Populators
 
-`populate_all_hexmaze(nwb_file_name)`: Populate all basic hex maze tables for a
-given NWB file. This populates:
+`populate_all_hexmaze(nwb_file_name)`: Populate all basic hex maze tables for a given NWB file. This populates:
 
 - `HexMazeBlock` and `HexMazeBlock.Trial`
 - `HexMazeChoice`
@@ -69,4 +71,12 @@ given NWB file. This populates:
 - `HexCentroids`
 - `HexMazeConfig`
 
+`populate_hex_position(nwb_file_name)`: Populate all position-based hex maze tables for a given NWB file (using all entries associated with the NWB file in `PositionOutput`). This populates:
 
+- `HexPositionSelection`
+- `HexPosition`
+- `HexPath`
+
+--> Additional method `populate_all_hex_position()` finds all valid `HexPositionSelection` keys (sessions that have HexMazeBlock, PositionOutput, and HexCentroids data) and and uses these to populate the `HexPositionSelection`, `HexPosition`, `HexPath` tables.
+
+`populate_all_fiber_photometry(nwb_file_name)`: 
