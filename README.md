@@ -42,24 +42,24 @@ This package provides three main modules:
 - `HexPosition` (Computed) - Processed position data assigned to hex centroids
 - `HexPath` (Computed) - Rat trajectories through the hex maze by trial, and associated hex-level path information
 
-Helper class `HexMazeTrialContext` also takes a trial key and provides a number of helper functions to analyze the trial in context
+--> Helper class `HexMazeTrialContext` also takes a trial key and provides a number of functions to analyze the trial in context (such as past history of rewards, rewards at the given port, previous visits to the given port on the same vs alternate path, etc)
 
 #### Decoding (`hex_maze_decoding`)
 
-- `DecodedPosition` (Computed) - Decoded position from neural activity using Bayesian decoding
-- `DecodedHexPositionSelection` (Manual) - Selection table for hex-aligned decoded positions
-- `DecodedHexPosition` (Computed) - Decoded position aligned to hex centroids
+- `DecodedPosition` (Computed) - Computes max likelihood x,y decoded position based on DecodingOutput
+- `DecodedHexPositionSelection` (Manual) - Selection table linking decoded position data to hex centroids and
+    hex maze epochs
+- `DecodedHexPosition` (Computed) - Decoded position assigned to hex centroids
 - `DecodedHexPath` (Computed) - Decoded trajectories through the hex maze
 
 #### Fiber Photometry (`berke_fiber_photometry`)
 
-- `ExcitationSource` (Manual) - Light sources used for fiber photometry
-- `Photodetector` (Manual) - Detectors for fiber photometry signals
-- `OpticalFiber` (Manual) - Optical fiber specifications
-- `Indicator` (Manual) - Fluorescent indicators (e.g., GCaMP, dLight)
-- `IndicatorInjection` (Manual) - Indicator injection details
-- `FiberPhotometrySeries` (Manual) - Time series data from fiber photometry
-    recordings
+- `ExcitationSource` (Manual) - Excitation sources used for fiber photometry
+- `Photodetector` (Manual) - Photodetectors used for fiber photometry
+- `OpticalFiber` (Manual) - Optical fibers used for fiber photometry
+- `Indicator` (Manual) - Fluorescent indicators (e.g. dLight, gACh4h)
+- `IndicatorInjection` (Manual) - Maps an indicator to its titer, volume and injection coordinates
+- `FiberPhotometrySeries` (Manual) - Stores series data from fiber photometry recordings
 
 ### Populators
 
@@ -79,4 +79,16 @@ Helper class `HexMazeTrialContext` also takes a trial key and provides a number 
 
 --> Additional method `populate_all_hex_position()` finds all valid `HexPositionSelection` keys (sessions that have HexMazeBlock, PositionOutput, and HexCentroids data) and and uses these to populate the `HexPositionSelection`, `HexPosition`, `HexPath` tables.
 
-`populate_all_fiber_photometry(nwb_file_name)`: 
+`populate_all_fiber_photometry(nwb_file_name)`: Populate all photometry-related tables for a given NWB file. This populates:
+
+- `ExcitationSource`
+- `Photodetector`
+- `OpticalFiber`
+- `Indicator`
+- `IndicatorInjection`
+- `FiberPhotometrySeries`
+
+---------
+
+### Notes
+The `berke_fiber_photometry` schema is in progress and currently relies on an outdated version of `ndx-fiber-photometry==0.1.0` to maintain compatability with spyglass. In the future, each FiberPhotometrySeries will be linked to its associated metadata (ExcitationSource, etc). Photometry series imported from NWB files (currently all added to `FiberPhotometrySeries`) will instead either be added to `RawFiberPhotometrySeries` (raw data, to be processed in spyglass) or `ImportedFiberPhotometrySeries` (already processed). These will be unified in a merge table for downstream processing. This work is planned for ~March 2026.
