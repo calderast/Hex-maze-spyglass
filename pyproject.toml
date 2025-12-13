@@ -30,7 +30,7 @@ dependencies = [
     "matplotlib",
     "datajoint",
     "pynwb",
-    "spyglass-neuro",
+    "spyglass-neuro>=0.5.4",
     "hex-maze-neuro",
     "non-local-detector>=0.6.9",
     "ndx-fiber-photometry==0.1.0",

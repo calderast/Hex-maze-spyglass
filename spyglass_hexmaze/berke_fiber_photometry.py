@@ -5,37 +5,17 @@ import numpy as np
 from pynwb import NWBHDF5IO
 from spyglass.common import IntervalList, Nwbfile
 from spyglass.utils import SpyglassMixin, logger
-
-try:
-    # Pip installable package does not have these classes yet
-    from ndx_fiber_photometry import (
-        DichroicMirror,
-        ExcitationSource,
-        FiberPhotometryResponseSeries,
-        Indicator,
-        OpticalFiber,
-        Photodetector,
-    )
-except ImportError:
-    logger.error("ndx_fiber_photometry does not have all expected classes.")
-    (
-        DichroicMirror,
-        ExcitationSource,
-        FiberPhotometryResponseSeries,
-        Indicator,
-        OpticalFiber,
-        Photodetector,
-    ) = (object,) * 6
+import ndx_fiber_photometry
 
 schema = dj.schema("berke_fiber_photometry")
 
 obj_attr_map = {
-    FiberPhotometryResponseSeries: "acquisition",
-    ExcitationSource: "devices",
-    Photodetector: "devices",
-    DichroicMirror: "devices",
-    OpticalFiber: "devices",
-    Indicator: "devices",
+    ndx_fiber_photometry.FiberPhotometryResponseSeries: "acquisition",
+    ndx_fiber_photometry.ExcitationSource: "devices",
+    ndx_fiber_photometry.Photodetector: "devices",
+    ndx_fiber_photometry.DichroicMirror: "devices",
+    ndx_fiber_photometry.OpticalFiber: "devices",
+    ndx_fiber_photometry.Indicator: "devices",
 }
 
 
@@ -49,34 +29,34 @@ def _get_photometry_objects(nwbfile, obj_type) -> list:
     ]
 
 
-def get_photometry_series(nwbfile) -> list[FiberPhotometryResponseSeries]:
+def get_photometry_series(nwbfile) -> list[ndx_fiber_photometry.FiberPhotometryResponseSeries]:
     """Return all FiberPhotometryResponseSeries in the acquisition group of an NWB file."""
-    return _get_photometry_objects(nwbfile, FiberPhotometryResponseSeries)
+    return _get_photometry_objects(nwbfile, ndx_fiber_photometry.FiberPhotometryResponseSeries)
 
 
-def get_excitation_sources(nwbfile) -> list[ExcitationSource]:
+def get_excitation_sources(nwbfile) -> list[ndx_fiber_photometry.ExcitationSource]:
     """Return all ExcitationSource devices in the NWB file."""
-    return _get_photometry_objects(nwbfile, ExcitationSource)
+    return _get_photometry_objects(nwbfile, ndx_fiber_photometry.ExcitationSource)
 
 
-def get_photodetectors(nwbfile) -> list[Photodetector]:
+def get_photodetectors(nwbfile) -> list[ndx_fiber_photometry.Photodetector]:
     """Return all Photodetector devices in the NWB file."""
-    return _get_photometry_objects(nwbfile, Photodetector)
+    return _get_photometry_objects(nwbfile, ndx_fiber_photometry.Photodetector)
 
 
-def get_dichroic_mirrors(nwbfile) -> list[DichroicMirror]:
+def get_dichroic_mirrors(nwbfile) -> list[ndx_fiber_photometry.DichroicMirror]:
     """Return all DichroicMirror devices in the NWB file."""
-    return _get_photometry_objects(nwbfile, DichroicMirror)
+    return _get_photometry_objects(nwbfile, ndx_fiber_photometry.DichroicMirror)
 
 
-def get_optic_fibers(nwbfile) -> list[OpticalFiber]:
+def get_optic_fibers(nwbfile) -> list[ndx_fiber_photometry.OpticalFiber]:
     """Return all OpticalFiber devices in the NWB file."""
-    return _get_photometry_objects(nwbfile, OpticalFiber)
+    return _get_photometry_objects(nwbfile, ndx_fiber_photometry.OpticalFiber)
 
 
-def get_indicators(nwbfile) -> list[Indicator]:
+def get_indicators(nwbfile) -> list[ndx_fiber_photometry.Indicator]:
     """Return all Indicator devices in the NWB file."""
-    return [obj for obj in nwbfile.devices.values() if isinstance(obj, Indicator)]
+    return [obj for obj in nwbfile.devices.values() if isinstance(obj, ndx_fiber_photometry.Indicator)]
 
 
 def populate_all_fiber_photometry(nwb_file_name, config: dict = {}):
