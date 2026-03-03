@@ -4,7 +4,7 @@ import datajoint as dj
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from non_local_detector.analysis import maximum_a_posteriori_estimate
+import non_local_detector.analysis as analysis
 from non_local_detector.model_checking import (
     get_highest_posterior_threshold,
     get_HPD_spatial_coverage,
@@ -50,17 +50,12 @@ class DecodedPosition(SpyglassMixin, dj.Computed):
 
     def make(self, key):
         # Get decode results
-        decode_key = {
-            "merge_id": key["decoding_merge_id"]
-        }  # in case the key contains multiple 'merge_id'
+        decode_key = {"merge_id": key["decoding_merge_id"]}  # in case the key contains multiple 'merge_id'
         results = DecodingOutput.fetch_results(decode_key)
 
         # Get the posterior (probability of decode at each x,y location at each time point)
         # posterior has shape (n_time, n_x_bins, n_y_bins)
-        posterior = results.acausal_posterior.unstack("state_bins").sum("state")
-
-        # posterior = np.squeeze(posterior, axis=0) # prev
-        posterior = posterior.squeeze()
+        posterior = results.acausal_posterior.squeeze().unstack("state_bins").sum("state")
 
         # Get timestamps
         # timestamps have shape (n_time,)
@@ -68,14 +63,11 @@ class DecodedPosition(SpyglassMixin, dj.Computed):
 
         # Get the max likelihood x,y coordinate at each time point
         # max_likelihood_position has shape (n_time, 2)
-        max_likelihood_position = maximum_a_posteriori_estimate(posterior)
+        max_likelihood_position = analysis.maximum_a_posteriori_estimate(posterior)
 
         # Get the threshold to plug into get_HPD_spatial_coverage
         # hpd_thresh has shape (n_time,)
-        hpd_thresh = get_highest_posterior_threshold(posterior, coverage=0.95)
-
-        # hpd_thresh = np.squeeze(hpd_thresh)
-        hpd_thresh = hpd_thresh.squeeze()
+        hpd_thresh = get_highest_posterior_threshold(posterior, coverage=0.95).squeeze()
 
         # posterior_stacked has shape (n_time, n_x_bins times n_y_bins)
         posterior_stacked = posterior.stack(position=["x_position", "y_position"])
@@ -113,6 +105,61 @@ class DecodedPosition(SpyglassMixin, dj.Computed):
 
     def fetch1_dataframe(self):
         return self.fetch_nwb()[0]["decoded_position"].set_index("time")
+
+
+@schema
+class DecodedPositionDistance(SpyglassMixin, dj.Computed):
+    """Combines actual position, decoded position, and ahead/behind distance."""
+
+    definition = """
+    -> DecodedPosition
+    ---
+    -> custom_AnalysisNwbfile
+    decoded_distance_object_id: varchar(128)
+    """
+
+    def make(self, key):
+        # Get decode results
+        decode_key = {"merge_id": key["decoding_merge_id"]}  # in case the key contains multiple 'merge_id'
+
+        # Get source table (SortedSpikesDecodingV1 or ClusterlessDecodingV1)
+        source_table = DecodingOutput().merge_restrict_class(decode_key)
+        classifier = source_table.fetch_model()
+
+        # Get position and orientation data
+        position_df, position_variable_names = source_table.fetch_position_info(source_table.fetch1("KEY"))
+        orientation_name = source_table.get_orientation_col(position_df)
+
+        # Get maximum likelihood decoded position from DecodedPosition table
+        decoded_position_df = (DecodedPosition & key).fetch1_dataframe()
+
+        # Align on shared time indices before computing distance
+        combined_df = pd.merge(position_df, decoded_position_df, left_index=True, right_index=True)
+
+        # Get decode distance from rat
+        ahead_behind_distance = analysis.get_ahead_behind_distance2D(
+            combined_df[position_variable_names].to_numpy(),
+            combined_df[orientation_name].to_numpy(),
+            combined_df[["pred_x", "pred_y"]].to_numpy(),
+            classifier.environments[0].track_graph,
+            classifier.environments[0].edges_,
+        )
+        combined_df["decode_distance"] = ahead_behind_distance
+
+        # Save time as a column instead of index (NWB requires integer index)
+        combined_df = combined_df.reset_index()
+
+        # Create an empty AnalysisNwbfile with a link to the original nwb
+        with custom_AnalysisNwbfile().build(key["nwb_file_name"]) as builder:
+            key["decoded_distance_object_id"] = builder.add_nwb_object(
+                combined_df, "decoded_distance"
+            )
+            key["analysis_file_name"] = builder.analysis_file_name
+
+        self.insert1(key)
+
+    def fetch1_dataframe(self):
+        return self.fetch_nwb()[0]["decoded_distance"].set_index("time")
 
 
 @schema
