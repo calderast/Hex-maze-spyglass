@@ -46,10 +46,8 @@ This package provides three main modules:
 
 #### Decoding (`hex_maze_decoding`)
 
-- `DecodedPosition` (Computed) - Computes max likelihood x,y decoded position based on DecodingOutput
-- `DecodedHexPositionSelection` (Manual) - Selection table linking decoded position data to hex centroids and
-    hex maze epochs
-- `DecodedHexPosition` (Computed) - Decoded position assigned to hex centroids
+- `HexMazeDecodedPosition` (Computed) - Computes max likelihood x,y decoded position based on DecodingOutput
+- `HexMazeDecodedPositionHex` (Computed) - Assigns hex to actual and decoded x,y position from HexMazeDecodedPosition
 - `DecodedHexPath` (Computed) - Decoded trajectories through the hex maze
 
 #### Fiber Photometry (`berke_fiber_photometry`)
@@ -91,4 +89,4 @@ This package provides three main modules:
 ---------
 
 ### Notes
-The `berke_fiber_photometry` schema is in progress and currently relies on an outdated version of `ndx-fiber-photometry==0.1.0` to maintain compatability with spyglass. In the future, each FiberPhotometrySeries will be linked to its associated metadata (ExcitationSource, etc). Photometry series imported from NWB files (currently all added to `FiberPhotometrySeries`) will instead either be added to `RawFiberPhotometrySeries` (raw data, to be processed in spyglass) or `ImportedFiberPhotometrySeries` (already processed). These will be unified in a merge table for downstream processing. This work is planned for ~March 2026.
+The `berke_fiber_photometry` schema is in progress and currently relies on an outdated version of `ndx-fiber-photometry==0.1.0` to maintain compatability with spyglass. In the future, each FiberPhotometrySeries will be linked to its associated metadata (ExcitationSource, etc). Photometry series imported from NWB files (currently all added to `FiberPhotometrySeries`) will instead either be added to `RawFiberPhotometrySeries` (raw data, to be processed in spyglass) or `ImportedFiberPhotometrySeries` (already processed). These will be unified in a merge table for downstream processing. This work is planned for ~April 2026.
