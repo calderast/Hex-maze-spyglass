@@ -22,7 +22,10 @@ try:
         classify_maze_hexes,
         divide_into_thirds,
         get_critical_choice_points,
+        get_hexes_before_divergence,
         get_hexes_from_port,
+        get_optimal_path_hexes_after_divergence,
+        get_path_divergence_point,
         get_unreachable_hexes,
         maze_to_barrier_set,
         get_hex_distance,
@@ -34,12 +37,15 @@ except ImportError:
         classify_maze_hexes,
         divide_into_thirds,
         get_critical_choice_points,
+        get_hexes_before_divergence,
         get_hexes_from_port,
+        get_optimal_path_hexes_after_divergence,
+        get_path_divergence_point,
         get_unreachable_hexes,
         maze_to_barrier_set,
         get_hex_distance,
         plot_hex_maze,
-    ) = (None,) * 8
+    ) = (None,) * 11
 
 
 schema = dj.schema("hex_maze_decoding")
@@ -220,17 +226,17 @@ class HexMazeDecodedPositionHex(SpyglassMixin, dj.Computed):
         position_df = (HexMazeDecodedPosition & key).fetch1_dataframe()
 
         # Set up a new df to store assigned hex info for each index in position_df
-        # (We use -1 and "None" instead of nan to avoid HDF5 datatype issues)
+        # (We use -100 and "None" instead of nan to avoid HDF5 datatype issues)
         n = len(position_df)
         hex_df = pd.DataFrame(
             {
-                "hex": np.full(n, -1),
+                "hex": np.full(n, -100),
                 "hex_including_sides": ["None"] * n,
-                "distance_from_centroid": np.full(n, -1.0),
-                "decode_hex": np.full(n, -1),
+                "distance_from_centroid": np.full(n, -100.0),
+                "decode_hex": np.full(n, -100),
                 "decode_hex_including_sides": ["None"] * n,
-                "decode_distance_from_centroid": np.full(n, -1.0),
-                "decode_hex_distance": np.full(n, -1),
+                "decode_distance_from_centroid": np.full(n, -100.0),
+                "decode_hex_distance": np.full(n, -100),
             },
             index=position_df.index,
         )
@@ -390,9 +396,9 @@ class HexMazeDecodedHexPath(SpyglassMixin, dj.Computed):
             # For each hex, compute distances to start and end port (actual and decoded)
             start_port, end_port = trial["start_port"], trial["end_port"]
             if start_port == "None":
-                # First trial does not have a start port, so we just fill with -1
-                hex_path["hexes_from_start"] = -1
-                hex_path["decode_hexes_from_start"] = -1
+                # First trial does not have a start port, so we just fill with -100
+                hex_path["hexes_from_start"] = -100
+                hex_path["decode_hexes_from_start"] = -100
             else:
                 hex_path["hexes_from_start"] = [
                     get_hexes_from_port(maze, start_hex=h, reward_port=start_port)
@@ -434,7 +440,7 @@ class HexMazeDecodedHexPath(SpyglassMixin, dj.Computed):
                 for h in hexes
             }
             # Map choice points to section 0
-            hex_to_maze_third.update({h: 0 for h in get_critical_choice_points(maze)})
+            hex_to_maze_third.update({h: 0 for h in get_critical_choice_points(maze, start_port if start_port != "None" else None)})
 
             # Identify the maze sections as 'start', 'chosen', or 'unchosen'
             # Note that for the first trial, start_port is None so start_section and unchosen_section will both be None
@@ -456,6 +462,23 @@ class HexMazeDecodedHexPath(SpyglassMixin, dj.Computed):
             hex_to_label = lambda h: str(label.get(hex_to_maze_third.get(h)))
             hex_path["maze_portion"] = hex_path["hex"].map(hex_to_label)
             hex_path["decode_maze_portion"] = hex_path["decode_hex"].map(hex_to_label)
+
+            # Compute distance from each hex to the critical choice point
+            # Pass start_port (or None for first trial) to get the relevant choice point(s)
+            choice_points = get_critical_choice_points(maze, start_port if start_port != "None" else None)
+            # Distance from actual hex to nearest choice point
+            # Distance is negative for hexes in the 'start' section (pre choice point), positive after
+            hex_path["hexes_from_choice"] = [
+                min(get_hex_distance(maze=maze, start_hex=h, target_hex=cp) for cp in choice_points)
+                * (-1 if hex_to_maze_third.get(h) == start_section else 1)
+                for h in hex_path["hex"]
+            ]
+            # Distance from decoded hex to nearest choice point
+            hex_path["decode_hexes_from_choice"] = [
+                min(get_hex_distance(maze=maze, start_hex=h, target_hex=cp) for cp in choice_points)
+                * (-1 if hex_to_maze_third.get(h) == start_section else 1)
+                for h in hex_path["decode_hex"]
+            ]
 
             # Add block/trial key columns and put them on the left
             key_cols = ["nwb_file_name", "epoch", "block", "block_trial_num", "epoch_trial_num"]
@@ -728,14 +751,14 @@ class HexMazeDecodedPositionAll(SpyglassMixin, dj.Computed):
         # Get a dict of hex: (x, y) centroid in cm for this nwbfile
         hex_centroids = HexCentroids.get_hex_centroids_dict_cm(key)
 
-        # Set up hex columns (use -1 and "None" instead of nan to avoid HDF5 datatype issues)
+        # Set up hex columns (use -100 and "None" instead of nan to avoid HDF5 datatype issues)
         for col in ["hex", "decode_hex"]:
-            combined_df[col] = -1
+            combined_df[col] = -100
         for col in ["hex_including_sides", "decode_hex_including_sides"]:
             combined_df[col] = "None"
         for col in ["distance_from_centroid", "decode_distance_from_centroid"]:
-            combined_df[col] = -1.0
-        combined_df["decode_hex_distance"] = -1
+            combined_df[col] = -100.0
+        combined_df["decode_hex_distance"] = -100
 
         # Loop through all blocks in this epoch
         for block in HexMazeBlock & {
@@ -808,5 +831,148 @@ class HexMazeDecodedPositionAll(SpyglassMixin, dj.Computed):
 
     def fetch1_dataframe_full(self):
         return self.fetch_nwb()[0]["decoded_position_all"].set_index("time")
+
+
+@schema
+class HexMazeDecodedHexPathBarrierChange(SpyglassMixin, dj.Computed):
+    """
+    Extension of HexMazeDecodedHexPath for barrier change sessions.
+    Adds columns for hex distance from the path divergence point, and
+    classifies each hex relative to the barrier change:
+    old_path, new_path, before_divergence, after_convergence, or other.
+
+    Only populates for sessions where at least one block is a barrier change.
+    """
+
+    definition = """
+    -> HexMazeDecodedHexPath
+    ---
+    -> custom_AnalysisNwbfile
+    barrier_change_hex_path_object_id: varchar(128)
+    """
+
+    def make(self, key):
+        nwb_file = key["nwb_file_name"]
+        epoch = key["epoch"]
+
+        # Get all blocks for this epoch, ordered by block number
+        blocks = (
+            HexMazeBlock & {"nwb_file_name": nwb_file, "epoch": epoch}
+        ).fetch(as_dict=True, order_by="block")
+
+        # Check that this is a barrier change session
+        if not any(b["task_type"] == "barrier change" for b in blocks):
+            return
+
+        # Build a map of block number to its maze config and the previous block's config
+        # For the first block (or non-barrier-change blocks), old_maze is None
+        block_maze_map = {}
+        for i, block in enumerate(blocks):
+            old_maze = blocks[i - 1]["config_id"] if i > 0 and block["task_type"] == "barrier change" else None
+            block_maze_map[block["block"]] = {
+                "new_maze": block["config_id"],
+                "old_maze": old_maze,
+            }
+
+        # Get the hex path dataframe from HexMazeDecodedHexPath
+        hex_path_df = (HexMazeDecodedHexPath & key).fetch1_dataframe()
+
+        # Initialize new columns
+        hex_path_df["hexes_from_divergence"] = -100
+        hex_path_df["decode_hexes_from_divergence"] = -100
+        hex_path_df["barrier_change_hex_class"] = "None"
+        hex_path_df["decode_barrier_change_hex_class"] = "None"
+
+        # Get trials for this epoch
+        trials = HexMazeBlock().Trial() & {"nwb_file_name": nwb_file, "epoch": epoch}
+
+        # Process each trial
+        for trial in trials:
+            block_num = trial["block"]
+            maze_info = block_maze_map[block_num]
+            old_maze = maze_info["old_maze"]
+            new_maze = maze_info["new_maze"]
+
+            # Skip trials in blocks that are not barrier changes
+            if old_maze is None:
+                continue
+
+            start_port = trial["start_port"]
+            end_port = trial["end_port"]
+
+            # Skip first trial with no start port
+            if start_port == "None":
+                continue
+
+            # Get rows for this trial
+            trial_mask = (
+                (hex_path_df["block"] == block_num)
+                & (hex_path_df["block_trial_num"] == trial["block_trial_num"])
+            )
+
+            # Get the path divergence point hex for this trial's start/end ports
+            divergence_hex = get_path_divergence_point(old_maze, new_maze, start_port, end_port)
+
+            # Classify hexes relative to the barrier change:
+            # before_divergence: hexes shared by old and new paths before the divergence point
+            # old_path: hexes unique to the old (pre-barrier-change) optimal path
+            # new_path: hexes unique to the new (post-barrier-change) optimal path
+            # after_convergence: hexes shared by old and new paths after convergence
+            # other: hexes not on either optimal path (dead ends, non-optimal)
+            before_div = get_hexes_before_divergence(old_maze, new_maze, start_port, end_port)
+
+            # Compute hex distance from divergence point for actual and decoded hex
+            # Negative for hexes before the divergence point (on the approach from start)
+            # If paths are identical (no divergence), fill with -100
+            trial_rows = hex_path_df.loc[trial_mask]
+            if divergence_hex is None:
+                hex_path_df.loc[trial_mask, "hexes_from_divergence"] = -100
+                hex_path_df.loc[trial_mask, "decode_hexes_from_divergence"] = -100
+            else:
+                hex_path_df.loc[trial_mask, "hexes_from_divergence"] = [
+                    get_hex_distance(maze=new_maze, start_hex=h, target_hex=divergence_hex)
+                    * (-1 if h in before_div else 1)
+                    for h in trial_rows["hex"]
+                ]
+                hex_path_df.loc[trial_mask, "decode_hexes_from_divergence"] = [
+                    get_hex_distance(maze=new_maze, start_hex=h, target_hex=divergence_hex)
+                    * (-1 if h in before_div else 1)
+                    for h in trial_rows["decode_hex"]
+                ]
+            hexes_on_old_path, hexes_on_new_path = get_optimal_path_hexes_after_divergence(
+                old_maze, new_maze, start_port, end_port
+            )
+            after_conv = get_hexes_before_divergence(old_maze, new_maze, end_port, start_port)
+
+            # Build hex -> classification lookup
+            hex_class = {}
+            for h in before_div:
+                hex_class[h] = "before_divergence"
+            for h in hexes_on_old_path:
+                hex_class[h] = "old_path"
+            for h in hexes_on_new_path:
+                hex_class[h] = "new_path"
+            for h in after_conv:
+                hex_class[h] = "after_convergence"
+
+            # Classify actual and decoded hexes (default to "other" if not in any category)
+            hex_path_df.loc[trial_mask, "barrier_change_hex_class"] = [
+                hex_class.get(h, "other") for h in trial_rows["hex"]
+            ]
+            hex_path_df.loc[trial_mask, "decode_barrier_change_hex_class"] = [
+                hex_class.get(h, "other") for h in trial_rows["decode_hex"]
+            ]
+
+        # Create an AnalysisNwbfile and save the dataframe
+        with custom_AnalysisNwbfile().build(nwb_file) as builder:
+            key["barrier_change_hex_path_object_id"] = builder.add_nwb_object(
+                hex_path_df, "barrier_change_hex_path"
+            )
+            key["analysis_file_name"] = builder.analysis_file_name
+
+        self.insert1(key)
+
+    def fetch1_dataframe(self):
+        return self.fetch_nwb()[0]["barrier_change_hex_path"]
 
 
