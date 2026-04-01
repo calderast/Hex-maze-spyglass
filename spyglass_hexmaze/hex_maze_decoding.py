@@ -683,7 +683,8 @@ class HexMazeDecodedPositionHexAnnotated(SpyglassMixin, dj.Computed):
         nwb_file = key["nwb_file_name"]
         epoch = key["epoch"]
 
-        # Initialize new columns with defaults
+        # Initialize new columns with defaults (-100 for numeric, "None" for string)
+        # Rows that fall outside any trial will keep these defaults
         hex_position_df["block"] = -100
         hex_position_df["block_trial_num"] = -100
         hex_position_df["epoch_trial_num"] = -100
@@ -693,73 +694,81 @@ class HexMazeDecodedPositionHexAnnotated(SpyglassMixin, dj.Computed):
         hex_position_df["decode_maze_portion"] = "None"
         hex_position_df["hexes_from_start"] = -100
         hex_position_df["hexes_from_end"] = -100
+        hex_position_df["hexes_from_unchosen"] = -100
+        hex_position_df["hexes_from_choice"] = -100
         hex_position_df["decode_hexes_from_start"] = -100
         hex_position_df["decode_hexes_from_end"] = -100
-        hex_position_df["hexes_from_choice"] = -100
+        hex_position_df["decode_hexes_from_unchosen"] = -100
         hex_position_df["decode_hexes_from_choice"] = -100
 
         # Get trials for this nwb+epoch
         trials = HexMazeBlock().Trial() & {"nwb_file_name": nwb_file, "epoch": epoch}
 
-        # Cache per-maze computations so we don't recompute for every trial in the same block
-        # Keys are maze config strings, values are precomputed dicts
-        maze_hex_type_cache = {}      # maze -> {hex: type_str}
-        maze_thirds_cache = {}        # maze -> {hex: third_num}
-        maze_port_dist_cache = {}     # (maze, port) -> {hex: distance}
-        maze_choice_dist_cache = {}   # (maze, start_port) -> {hex: signed_distance}
+        port_map = {"A": 1, "B": 2, "C": 3}
+
+        # Caches for per-maze computations (avoid recomputing for trials in the same block)
+        hex_type_cache = {}       # maze -> {hex: type_str}
+        thirds_cache = {}         # maze -> {hex: third_num}
+        port_dist_cache = {}      # (maze, port) -> {hex: distance}
+        choice_dist_cache = {}    # (maze, start_port) -> {hex: signed_distance}
+
+        def _get_open_hexes(maze):
+            """All reachable open hexes in the maze (1-49 minus barriers and unreachable)."""
+            return set(range(1, 50)) - maze_to_barrier_set(maze) - get_unreachable_hexes(maze)
 
         def _get_hex_type_map(maze):
-            """Get or compute hex -> type mapping for this maze config."""
-            if maze not in maze_hex_type_cache:
-                maze_hex_type_cache[maze] = {
+            """Hex -> classification (optimal, non_optimal, or dead_end)."""
+            if maze not in hex_type_cache:
+                hex_type_cache[maze] = {
                     h: name.replace("_hexes", "")
                     for name, hexes in classify_maze_hexes(maze).items()
                     if name in {"optimal_hexes", "non_optimal_hexes", "dead_end_hexes"}
                     for h in hexes
                 }
-            return maze_hex_type_cache[maze]
+            return hex_type_cache[maze]
 
         def _get_thirds_map(maze):
-            """Get or compute hex -> maze third mapping for this maze config."""
-            if maze not in maze_thirds_cache:
-                maze_thirds_cache[maze] = {
+            """Hex -> maze third (1, 2, or 3 for near port A, B, or C)."""
+            if maze not in thirds_cache:
+                thirds_cache[maze] = {
                     h: third_num
                     for third_num, hexes in enumerate(divide_into_thirds(maze), start=1)
                     for h in hexes
                 }
-            return maze_thirds_cache[maze]
+            return thirds_cache[maze]
 
         def _get_port_dist_map(maze, port):
-            """Get or compute hex -> distance-from-port for every hex in the maze."""
+            """Hex -> distance from the given reward port."""
             cache_key = (maze, port)
-            if cache_key not in maze_port_dist_cache:
-                # Precompute distance for every hex that exists in the maze
-                all_hexes = set(_get_thirds_map(maze).keys())
-                maze_port_dist_cache[cache_key] = {
+            if cache_key not in port_dist_cache:
+                port_dist_cache[cache_key] = {
                     h: get_hexes_from_port(maze, start_hex=h, reward_port=port)
-                    for h in all_hexes
+                    for h in _get_open_hexes(maze)
                 }
-            return maze_port_dist_cache[cache_key]
+            return port_dist_cache[cache_key]
 
         def _get_choice_dist_map(maze, start_port):
-            """Get or compute hex -> signed distance from choice point for every hex."""
-            sp = start_port if start_port != "None" else None
+            """Hex -> signed distance from the critical choice point.
+
+            Negative for hexes in the start section (before choice point),
+            positive for hexes after the choice point.
+            """
             cache_key = (maze, start_port)
-            if cache_key not in maze_choice_dist_cache:
+            if cache_key not in choice_dist_cache:
+                sp = start_port if start_port != "None" else None
                 choice_points = get_critical_choice_points(maze, sp)
-                hex_to_third = _get_thirds_map(maze)
-                # Also add choice points with section 0
-                hex_to_third_with_cp = dict(hex_to_third)
-                hex_to_third_with_cp.update({h: 0 for h in choice_points})
-                port_map = {"A": 1, "B": 2, "C": 3}
                 start_section = port_map.get(start_port)
-                all_hexes = set(hex_to_third.keys())
-                maze_choice_dist_cache[cache_key] = {
+
+                # Build hex -> section map including choice points as section 0
+                hex_to_section = dict(_get_thirds_map(maze))
+                hex_to_section.update({h: 0 for h in choice_points})
+
+                choice_dist_cache[cache_key] = {
                     h: min(get_hex_distance(maze=maze, start_hex=h, target_hex=cp) for cp in choice_points)
-                    * (-1 if hex_to_third_with_cp.get(h) == start_section else 1)
-                    for h in all_hexes
+                    * (-1 if hex_to_section.get(h) == start_section else 1)
+                    for h in _get_open_hexes(maze)
                 }
-            return maze_choice_dist_cache[cache_key]
+            return choice_dist_cache[cache_key]
 
         for trial in trials:
             # Get trial time bounds
@@ -784,64 +793,68 @@ class HexMazeDecodedPositionHexAnnotated(SpyglassMixin, dj.Computed):
             # Filter to this trial's timepoints
             trial_df = hex_position_df.loc[trial_start:trial_end]
             idx = trial_df.index
+            start_port, end_port = trial["start_port"], trial["end_port"]
 
-            # Block and trial identifiers
+            # --- Trial identifiers ---
             hex_position_df.loc[idx, "block"] = trial["block"]
             hex_position_df.loc[idx, "block_trial_num"] = trial["block_trial_num"]
             hex_position_df.loc[idx, "epoch_trial_num"] = trial["epoch_trial_num"]
 
-            # Classify each hex as optimal, non-optimal, or dead-end (precomputed per maze)
+            # --- Hex classification (optimal, non-optimal, dead-end) ---
             hex_to_type = _get_hex_type_map(maze)
             hex_position_df.loc[idx, "hex_type"] = trial_df["hex"].map(hex_to_type).fillna("None")
             hex_position_df.loc[idx, "decode_hex_type"] = trial_df["decode_hex"].map(hex_to_type).fillna("None")
 
-            # Map each hex to the section of the maze it's in (1, 2, or 3 for near port A, B, or C)
-            start_port, end_port = trial["start_port"], trial["end_port"]
-            hex_to_maze_third = dict(_get_thirds_map(maze))
-            # Map choice points to section 0
-            hex_to_maze_third.update({
+            # --- Maze portion (start, chosen, unchosen, choice_point) ---
+            # Build hex -> section map: thirds (1/2/3) + choice points (0)
+            hex_to_section = dict(_get_thirds_map(maze))
+            hex_to_section.update({
                 h: 0 for h in get_critical_choice_points(maze, start_port if start_port != "None" else None)
             })
 
-            # Identify the maze sections as 'start', 'chosen', or 'unchosen'
-            port_map = {"A": 1, "B": 2, "C": 3}
+            # Map section numbers to trial-relative labels
             start_section = port_map.get(start_port)
             chosen_section = port_map.get(end_port)
             unchosen_section = {1, 2, 3} - {chosen_section} - {start_section}
             unchosen_section = unchosen_section.pop() if len(unchosen_section) == 1 else None
 
-            # Map maze section number to its label
-            label = {
+            section_to_label = {
                 start_section: "start",
                 chosen_section: "chosen",
                 unchosen_section: "unchosen",
                 0: "choice_point",
             }
 
-            # Build hex -> maze_portion label lookup (precomputed, just needs relabeling per trial)
-            hex_to_label = {h: str(label.get(third)) for h, third in hex_to_maze_third.items()}
-            hex_position_df.loc[idx, "maze_portion"] = trial_df["hex"].map(hex_to_label)
-            hex_position_df.loc[idx, "decode_maze_portion"] = trial_df["decode_hex"].map(hex_to_label)
+            hex_to_label = {h: str(section_to_label.get(section)) for h, section in hex_to_section.items()}
+            hex_position_df.loc[idx, "maze_portion"] = trial_df["hex"].map(hex_to_label).fillna("None")
+            hex_position_df.loc[idx, "decode_maze_portion"] = trial_df["decode_hex"].map(hex_to_label).fillna("None")
 
-            # Distance from start and end ports (precomputed per unique hex, then mapped)
+            # --- Distance from ports ---
+            # fillna(-100) keeps the sentinel consistent for unmapped hexes (e.g. hex == -100)
             if start_port != "None":
                 start_dist = _get_port_dist_map(maze, start_port)
-                hex_position_df.loc[idx, "hexes_from_start"] = trial_df["hex"].map(start_dist)
-                hex_position_df.loc[idx, "decode_hexes_from_start"] = trial_df["decode_hex"].map(start_dist)
+                hex_position_df.loc[idx, "hexes_from_start"] = trial_df["hex"].map(start_dist).fillna(-100)
+                hex_position_df.loc[idx, "decode_hexes_from_start"] = trial_df["decode_hex"].map(start_dist).fillna(-100)
 
             end_dist = _get_port_dist_map(maze, end_port)
-            hex_position_df.loc[idx, "hexes_from_end"] = trial_df["hex"].map(end_dist)
-            hex_position_df.loc[idx, "decode_hexes_from_end"] = trial_df["decode_hex"].map(end_dist)
+            hex_position_df.loc[idx, "hexes_from_end"] = trial_df["hex"].map(end_dist).fillna(-100)
+            hex_position_df.loc[idx, "decode_hexes_from_end"] = trial_df["decode_hex"].map(end_dist).fillna(-100)
 
-            # Signed distance from critical choice point(s) (precomputed per unique hex)
+            unchosen_port = {"A", "B", "C"} - {start_port, end_port}
+            if len(unchosen_port) == 1:
+                unchosen_dist = _get_port_dist_map(maze, unchosen_port.pop())
+                hex_position_df.loc[idx, "hexes_from_unchosen"] = trial_df["hex"].map(unchosen_dist).fillna(-100)
+                hex_position_df.loc[idx, "decode_hexes_from_unchosen"] = trial_df["decode_hex"].map(unchosen_dist).fillna(-100)
+
+            # --- Signed distance from choice point ---
             choice_dist = _get_choice_dist_map(maze, start_port)
-            hex_position_df.loc[idx, "hexes_from_choice"] = trial_df["hex"].map(choice_dist)
-            hex_position_df.loc[idx, "decode_hexes_from_choice"] = trial_df["decode_hex"].map(choice_dist)
+            hex_position_df.loc[idx, "hexes_from_choice"] = trial_df["hex"].map(choice_dist).fillna(-100)
+            hex_position_df.loc[idx, "decode_hexes_from_choice"] = trial_df["decode_hex"].map(choice_dist).fillna(-100)
 
         # Save time as a column instead of index (NWB requires integer index)
         hex_position_df = hex_position_df.reset_index()
 
-        # Create an AnalysisNwbfile with a link to the original nwb and add the df
+        # Write to NWB analysis file
         with custom_AnalysisNwbfile().build(key["nwb_file_name"]) as builder:
             key["annotated_hex_object_id"] = builder.add_nwb_object(hex_position_df, "annotated_hex")
             key["analysis_file_name"] = builder.analysis_file_name
