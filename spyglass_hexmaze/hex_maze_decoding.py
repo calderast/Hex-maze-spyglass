@@ -1,6 +1,7 @@
 import re
 
 import datajoint as dj
+import networkx as nx
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -21,13 +22,16 @@ try:
     from hexmaze import (
         classify_maze_hexes,
         divide_into_thirds,
+        get_all_choice_points,
         get_critical_choice_points,
+        get_junction_left_right_map,
         get_hexes_before_divergence,
         get_hexes_from_port,
         get_optimal_path_hexes_after_divergence,
         get_path_divergence_point,
         get_unreachable_hexes,
         maze_to_barrier_set,
+        maze_to_graph,
         get_hex_distance,
         plot_hex_maze,
     )
@@ -36,16 +40,19 @@ except ImportError:
     (
         classify_maze_hexes,
         divide_into_thirds,
+        get_all_choice_points,
         get_critical_choice_points,
+        get_junction_left_right_map,
         get_hexes_before_divergence,
         get_hexes_from_port,
         get_optimal_path_hexes_after_divergence,
         get_path_divergence_point,
         get_unreachable_hexes,
         maze_to_barrier_set,
+        maze_to_graph,
         get_hex_distance,
         plot_hex_maze,
-    ) = (None,) * 11
+    ) = (None,) * 14
 
 
 schema = dj.schema("hex_maze_decoding")
@@ -1177,5 +1184,235 @@ class HexMazeDecodedHexPathBarrierChange(SpyglassMixin, dj.Computed):
 
     def fetch1_dataframe(self):
         return self.fetch_nwb()[0]["barrier_change_hex_path"]
+
+
+@schema
+class HexMazeJunctionDecode(SpyglassMixin, dj.Computed):
+    """
+    Adds per-timepoint junction context to HexMazeDecodedPositionHexAnnotated.
+
+    For every 3-way junction (degree-3 hex) in the maze, this table identifies
+    when the rat passes through and classifies:
+    - The entry direction (which neighbor the rat came from)
+    - Which exit is "left" vs "right" (via cross-product geometry)
+    - Which direction the rat actually went
+    - Which direction the decode_hex points toward (via graph distance)
+
+    This enables analysis of whether the neural decoder anticipates upcoming
+    turns at arbitrary maze junctions, not just the critical choice point.
+    """
+
+    definition = """
+    -> HexMazeDecodedPositionHexAnnotated
+    ---
+    -> custom_AnalysisNwbfile
+    junction_decode_object_id: varchar(128)
+    """
+
+    def make(self, key):
+        # Get per-timepoint annotated dataframe from parent table
+        annotated_df = (HexMazeDecodedPositionHexAnnotated & key).fetch1_dataframe()
+        nwb_file = key["nwb_file_name"]
+        epoch = key["epoch"]
+
+        # Initialize new columns with defaults
+        # -100 for numeric columns, "None" for string columns
+        annotated_df["nearest_junction"] = -100
+        annotated_df["hexes_from_junction"] = -100
+        annotated_df["junction_entry_hex"] = -100
+        annotated_df["junction_left_exit"] = -100
+        annotated_df["junction_right_exit"] = -100
+        annotated_df["rat_junction_direction"] = "None"
+        annotated_df["decode_junction_direction"] = "None"
+
+        # Get trials for this nwb+epoch
+        trials = HexMazeBlock().Trial() & {"nwb_file_name": nwb_file, "epoch": epoch}
+
+        # Caches for per-maze computations (avoid recomputing across trials in same block)
+        junction_lr_cache = {}       # maze -> junction left/right map
+        all_pairs_dist_cache = {}    # maze -> dict of all-pairs shortest path lengths
+        junction_set_cache = {}      # maze -> set of junction hex IDs
+
+        def _get_junction_set(maze):
+            """Get the set of 3-way junction hexes for this maze."""
+            if maze not in junction_set_cache:
+                junction_set_cache[maze] = get_all_choice_points(maze)
+            return junction_set_cache[maze]
+
+        def _get_junction_lr(maze):
+            """Get the junction left/right map for this maze."""
+            if maze not in junction_lr_cache:
+                junction_lr_cache[maze] = get_junction_left_right_map(maze)
+            return junction_lr_cache[maze]
+
+        def _get_all_pairs_dist(maze):
+            """Get all-pairs shortest path lengths for this maze (for fast distance lookups)."""
+            if maze not in all_pairs_dist_cache:
+                graph = maze_to_graph(maze)
+                all_pairs_dist_cache[maze] = dict(nx.all_pairs_shortest_path_length(graph))
+            return all_pairs_dist_cache[maze]
+
+        def _classify_decode_direction(decode_hex, left_exit, right_exit, dist_dict):
+            """Classify decode_hex as 'left', 'right', or 'ambiguous' based on graph distance."""
+            # If decode_hex is not reachable (e.g., -100 sentinel), return "None"
+            if decode_hex not in dist_dict:
+                return "None"
+            dist_left = dist_dict[decode_hex].get(left_exit, float("inf"))
+            dist_right = dist_dict[decode_hex].get(right_exit, float("inf"))
+            if dist_left < dist_right:
+                return "left"
+            elif dist_right < dist_left:
+                return "right"
+            else:
+                return "ambiguous"
+
+        for trial in trials:
+            # Get trial time bounds
+            trial_start, trial_end = (
+                sgc.IntervalList
+                & {
+                    "nwb_file_name": trial["nwb_file_name"],
+                    "interval_list_name": trial["interval_list_name"],
+                }
+            ).fetch1("valid_times")[0]
+
+            # Get maze configuration for this block
+            maze = (
+                HexMazeBlock()
+                & {
+                    "nwb_file_name": trial["nwb_file_name"],
+                    "block": trial["block"],
+                    "epoch": trial["epoch"],
+                }
+            ).fetch1("config_id")
+
+            # Get per-maze data structures
+            junction_hexes = _get_junction_set(maze)
+            junction_lr = _get_junction_lr(maze)
+            dist_dict = _get_all_pairs_dist(maze)
+
+            # Filter to this trial's timepoints
+            trial_df = annotated_df.loc[trial_start:trial_end]
+            if len(trial_df) == 0:
+                continue
+
+            # Build the hex sequence for this trial by finding contiguous segments
+            # where the rat stays at the same hex
+            hex_series = trial_df["hex"]
+            hex_changed = hex_series != hex_series.shift()
+            segment_ids = hex_changed.cumsum()
+
+            # Build a list of (hex_id, start_time, end_time) for each segment
+            segments = []
+            for seg_id, seg_df in trial_df.groupby(segment_ids):
+                segments.append({
+                    "hex": seg_df["hex"].iloc[0],
+                    "start_time": seg_df.index[0],
+                    "end_time": seg_df.index[-1],
+                })
+
+            # Walk through segments to find junction encounters
+            # For each junction segment, we need the previous and next hex to determine
+            # entry direction and actual exit
+            for i, seg in enumerate(segments):
+                seg_hex = seg["hex"]
+                if seg_hex not in junction_hexes:
+                    continue
+
+                # Need a previous segment to determine entry direction
+                if i == 0:
+                    continue
+                # Need a next segment to determine actual exit
+                if i == len(segments) - 1:
+                    continue
+
+                entry_hex = segments[i - 1]["hex"]
+                actual_exit = segments[i + 1]["hex"]
+
+                # Verify entry_hex is a valid neighbor of this junction
+                lr_key = (seg_hex, entry_hex)
+                if lr_key not in junction_lr:
+                    # Entry hex is not a direct neighbor (hex was skipped), skip
+                    continue
+
+                lr = junction_lr[lr_key]
+                left_exit = lr["left"]
+                right_exit = lr["right"]
+
+                # Determine which direction the rat actually went
+                if actual_exit == left_exit:
+                    rat_direction = "left"
+                elif actual_exit == right_exit:
+                    rat_direction = "right"
+                elif actual_exit == entry_hex:
+                    rat_direction = "back"
+                else:
+                    # Exit is not one of the expected neighbors (hex skipped)
+                    rat_direction = "None"
+
+                # Get timepoint indices for this junction segment
+                seg_idx = trial_df.loc[seg["start_time"]:seg["end_time"]].index
+
+                # Annotate each timepoint at this junction
+                annotated_df.loc[seg_idx, "nearest_junction"] = seg_hex
+                annotated_df.loc[seg_idx, "hexes_from_junction"] = 0
+                annotated_df.loc[seg_idx, "junction_entry_hex"] = entry_hex
+                annotated_df.loc[seg_idx, "junction_left_exit"] = left_exit
+                annotated_df.loc[seg_idx, "junction_right_exit"] = right_exit
+                annotated_df.loc[seg_idx, "rat_junction_direction"] = rat_direction
+
+                # Classify decode direction for each timepoint at the junction
+                annotated_df.loc[seg_idx, "decode_junction_direction"] = [
+                    _classify_decode_direction(dh, left_exit, right_exit, dist_dict)
+                    for dh in annotated_df.loc[seg_idx, "decode_hex"]
+                ]
+
+                # Annotate approach segments BEFORE the junction (walking backwards)
+                # Stop when we hit another junction or an already-annotated hex
+                for j in range(i - 1, -1, -1):
+                    prev_seg = segments[j]
+                    prev_hex = prev_seg["hex"]
+                    # Stop if we hit another junction — it owns its own timepoints
+                    if prev_hex in junction_hexes:
+                        break
+                    # Compute graph distance from this hex to the junction
+                    if prev_hex not in dist_dict or seg_hex not in dist_dict.get(prev_hex, {}):
+                        break
+                    dist_to_junc = dist_dict[prev_hex][seg_hex]
+
+                    prev_idx = trial_df.loc[prev_seg["start_time"]:prev_seg["end_time"]].index
+                    # Only annotate if not already claimed by a closer junction
+                    current_vals = annotated_df.loc[prev_idx, "hexes_from_junction"]
+                    if (current_vals != -100).any():
+                        existing_dist = current_vals[current_vals != -100].abs().min()
+                        if dist_to_junc >= existing_dist:
+                            continue
+
+                    # Negative distance = approaching the upcoming junction
+                    annotated_df.loc[prev_idx, "nearest_junction"] = seg_hex
+                    annotated_df.loc[prev_idx, "hexes_from_junction"] = -dist_to_junc
+                    annotated_df.loc[prev_idx, "junction_entry_hex"] = entry_hex
+                    annotated_df.loc[prev_idx, "junction_left_exit"] = left_exit
+                    annotated_df.loc[prev_idx, "junction_right_exit"] = right_exit
+                    annotated_df.loc[prev_idx, "rat_junction_direction"] = rat_direction
+                    annotated_df.loc[prev_idx, "decode_junction_direction"] = [
+                        _classify_decode_direction(dh, left_exit, right_exit, dist_dict)
+                        for dh in annotated_df.loc[prev_idx, "decode_hex"]
+                    ]
+
+        # Save time as a column instead of index (NWB requires integer index)
+        annotated_df = annotated_df.reset_index()
+
+        # Write to NWB analysis file
+        with custom_AnalysisNwbfile().build(key["nwb_file_name"]) as builder:
+            key["junction_decode_object_id"] = builder.add_nwb_object(
+                annotated_df, "junction_decode"
+            )
+            key["analysis_file_name"] = builder.analysis_file_name
+
+        self.insert1(key)
+
+    def fetch1_dataframe(self):
+        return self.fetch_nwb()[0]["junction_decode"].set_index("time")
 
 
