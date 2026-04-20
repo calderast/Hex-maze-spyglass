@@ -713,7 +713,7 @@ class HexMazeDecodedPositionHexAnnotated(SpyglassMixin, dj.Computed):
 
         port_map = {"A": 1, "B": 2, "C": 3}
 
-        # Caches for per-maze computations (avoid recomputing for trials in the same block)
+        # Caches for per-maze computations (avoid recomputing for trials in the same block, makes it way faster)
         hex_type_cache = {}       # maze -> {hex: type_str}
         thirds_cache = {}         # maze -> {hex: third_num}
         port_dist_cache = {}      # (maze, port) -> {hex: distance}
@@ -802,17 +802,17 @@ class HexMazeDecodedPositionHexAnnotated(SpyglassMixin, dj.Computed):
             idx = trial_df.index
             start_port, end_port = trial["start_port"], trial["end_port"]
 
-            # --- Trial identifiers ---
+            # Trial identifiers
             hex_position_df.loc[idx, "block"] = trial["block"]
             hex_position_df.loc[idx, "block_trial_num"] = trial["block_trial_num"]
             hex_position_df.loc[idx, "epoch_trial_num"] = trial["epoch_trial_num"]
 
-            # --- Hex classification (optimal, non-optimal, dead-end) ---
+            # Hex classification (optimal, non-optimal, dead-end)
             hex_to_type = _get_hex_type_map(maze)
             hex_position_df.loc[idx, "hex_type"] = trial_df["hex"].map(hex_to_type).fillna("None")
             hex_position_df.loc[idx, "decode_hex_type"] = trial_df["decode_hex"].map(hex_to_type).fillna("None")
 
-            # --- Maze portion (start, chosen, unchosen, choice_point) ---
+            # Maze portion (start, chosen, unchosen, choice_point)
             # Build hex -> section map: thirds (1/2/3) + choice points (0)
             hex_to_section = dict(_get_thirds_map(maze))
             hex_to_section.update({
@@ -836,8 +836,7 @@ class HexMazeDecodedPositionHexAnnotated(SpyglassMixin, dj.Computed):
             hex_position_df.loc[idx, "maze_portion"] = trial_df["hex"].map(hex_to_label).fillna("None")
             hex_position_df.loc[idx, "decode_maze_portion"] = trial_df["decode_hex"].map(hex_to_label).fillna("None")
 
-            # --- Distance from ports ---
-            # fillna(-100) keeps the sentinel consistent for unmapped hexes (e.g. hex == -100)
+            # Distance from ports
             if start_port != "None":
                 start_dist = _get_port_dist_map(maze, start_port)
                 hex_position_df.loc[idx, "hexes_from_start"] = trial_df["hex"].map(start_dist).fillna(-100)
@@ -853,7 +852,7 @@ class HexMazeDecodedPositionHexAnnotated(SpyglassMixin, dj.Computed):
                 hex_position_df.loc[idx, "hexes_from_unchosen"] = trial_df["hex"].map(unchosen_dist).fillna(-100)
                 hex_position_df.loc[idx, "decode_hexes_from_unchosen"] = trial_df["decode_hex"].map(unchosen_dist).fillna(-100)
 
-            # --- Signed distance from choice point ---
+            # Signed distance from choice point
             choice_dist = _get_choice_dist_map(maze, start_port)
             hex_position_df.loc[idx, "hexes_from_choice"] = trial_df["hex"].map(choice_dist).fillna(-100)
             hex_position_df.loc[idx, "decode_hexes_from_choice"] = trial_df["decode_hex"].map(choice_dist).fillna(-100)
