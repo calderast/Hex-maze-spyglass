@@ -676,6 +676,7 @@ class HexMazeDecodedPositionHexAnnotated(SpyglassMixin, dj.Computed):
     Adds per-timepoint maze annotations to HexMazeDecodedPositionHex.
     Same columns as HexMazeDecodedHexPath (hex_type, maze_portion, hexes_from_start/end/choice, etc.)
     but without aggregation — one row per timepoint, not per hex segment.
+    This is nice so we can filter by speed, spatial coverage, etc. at each time point
     """
 
     definition = """
@@ -1051,7 +1052,7 @@ class HexMazeDecodedHexPathBarrierChange(SpyglassMixin, dj.Computed):
     classifies each hex relative to the barrier change:
     old_path, new_path, before_divergence, after_convergence, or other.
 
-    Only populates for sessions where at least one block is a barrier change.
+    Only populates for barrier change sessions.
     """
 
     definition = """
@@ -1534,11 +1535,42 @@ class HexMazeThetaV1(SpyglassMixin, dj.Computed):
         """
         return self.fetch_nwb()[0]["theta_power"].set_index("time")
 
+    def average_analytic_signal(self, electrode_list) -> pd.Series:
+        """Average the complex analytic signal across a set of electrodes, indexed by time.
+
+        Averaging the complex signal (not the phases) is the correct way to combine
+        channels: in-phase theta adds, noise cancels. electrode_list entries can be
+        ints or strings ("57").
+        """
+        analytic = self.fetch1_analytic_signal()
+        z = sum(
+            analytic[f"electrode {int(e)}_real"] + 1j * analytic[f"electrode {int(e)}_imag"]
+            for e in electrode_list
+        ) / len(electrode_list)
+        z.name = "analytic_signal"
+        return z
+
+    def average_theta_phase(self, electrode_list) -> pd.Series:
+        """Averaged theta phase (radians [0, 2π]) across a set of electrodes, indexed by time."""
+        z = self.average_analytic_signal(electrode_list)
+        return pd.Series(np.mod(np.angle(z), 2 * np.pi), index=z.index, name="theta_phase")
+
+    def average_theta_power(self, electrode_list) -> pd.Series:
+        """Averaged theta power across a set of electrodes, indexed by time.
+
+        This is the mean of the per-channel power envelopes (average of powers), which is
+        robust to small phase differences between channels. For the *coherent* power of the
+        combined waveform instead (power of the average, which sags if channels drift out
+        of phase) use np.abs(self.average_analytic_signal(electrode_list)) ** 2.
+        """
+        power_df = self.fetch1_theta_power()
+        columns = [f"electrode {int(e)}" for e in electrode_list]
+        return power_df[columns].mean(axis=1).rename("theta_power")
+
     def get_high_theta_intervals(
         self,
         threshold_percentile: float = 75.0,
-        electrode: str = "best",
-        smooth_sigma: float = None,
+        electrode=None,
         min_duration: float = 0.1,
     ) -> np.ndarray:
         """Return time intervals where theta power exceeds a percentile threshold.
@@ -1548,16 +1580,13 @@ class HexMazeThetaV1(SpyglassMixin, dj.Computed):
         threshold_percentile : float
             Percentile of the theta power distribution to use as the threshold.
             Default 75 = top quartile of theta power.
-        electrode : str, optional
-            Column name of a specific electrode to threshold (e.g. "electrode 3").
-            Default "best": automatically selects the electrode with the highest
-            median theta power, which tends to be the channel nearest the
-            hippocampal layer where theta amplitude is largest.
-            Pass None to average power across all electrodes instead.
-        smooth_sigma : float, optional
-            Gaussian smoothing kernel width in seconds applied to the power
-            signal before thresholding. Helps avoid single-sample spikes
-            being counted as high-theta periods. If None, no smoothing is applied.
+        electrode : str | list, optional
+            Which signal to threshold:
+            - a single electrode as 3, "3", or "electrode 3": that one electrode.
+            - a list/set of electrode ids (ints or "57" strings): average the per-channel
+              theta power across them — use this to threshold on a saved reference set
+              (e.g. stratum radiatum).
+            - None (default): average power across all electrodes.
         min_duration : float
             Minimum interval duration in seconds. Intervals shorter than this
             are discarded. Default 0.1 s.
@@ -1570,10 +1599,10 @@ class HexMazeThetaV1(SpyglassMixin, dj.Computed):
 
         Examples
         --------
-        # Get times when theta is in the top 25% (uses best electrode automatically)
-        high_theta = (HexMazeThetaV1 & key).get_high_theta_intervals(threshold_percentile=75)
+        # Average a set of reference electrodes (e.g. a saved radiatum set), top 25%
+        high_theta = (HexMazeThetaV1 & key).get_high_theta_intervals(electrode=[57, 58, 65])
 
-        # Use a specific electrode
+        # Use a single electrode
         high_theta = (HexMazeThetaV1 & key).get_high_theta_intervals(electrode="electrode 57")
 
         # Filter a dataframe to high-theta times
@@ -1582,28 +1611,24 @@ class HexMazeThetaV1(SpyglassMixin, dj.Computed):
             mask |= (df.index >= start) & (df.index <= end)
         df_high_theta = df[mask]
         """
-        power_df = self.fetch1_theta_power()
-
-        # Select electrode signal to threshold
-        if electrode == "best":
-            # Pick the electrode with the highest median power — tends to be the
-            # channel closest to the hippocampal layer where theta is largest.
-            best_col = power_df.median().idxmax()
-            power = power_df[best_col].to_numpy(dtype=float)
-        elif electrode is not None:
-            power = power_df[electrode].to_numpy(dtype=float)
+        # Select the theta-power signal to threshold
+        if isinstance(electrode, (list, tuple, set, np.ndarray)):
+            # Average the per-channel theta power across a set of reference electrodes
+            # and threshold that (robust to small inter-channel phase differences).
+            power_series = self.average_theta_power(electrode)
+            power = power_series.to_numpy(dtype=float)
+            times = power_series.index.to_numpy()
         else:
-            # Average across all electrodes (not recommended for sessions with
-            # many channels from mixed brain regions)
-            power = power_df.mean(axis=1).to_numpy(dtype=float)
-
-        times = power_df.index.to_numpy()
-
-        # Optionally smooth before thresholding to avoid single-sample spikes
-        if smooth_sigma is not None:
-            from scipy.ndimage import gaussian_filter1d
-            dt = float(np.median(np.diff(times)))
-            power = gaussian_filter1d(power, sigma=smooth_sigma / dt)
+            power_df = self.fetch1_theta_power()
+            times = power_df.index.to_numpy()
+            if electrode is not None:
+                # Accept 57, "57", or "electrode 57" -- normalize to the column name
+                column = f"electrode {int(str(electrode).split()[-1])}"
+                power = power_df[column].to_numpy(dtype=float)
+            else:
+                # Average across all electrodes (not recommended for sessions with
+                # many channels from mixed brain regions)
+                power = power_df.mean(axis=1).to_numpy(dtype=float)
 
         # Threshold at the requested percentile
         threshold = float(np.nanpercentile(power, threshold_percentile))
@@ -1794,3 +1819,78 @@ class HexMazeThetaV1(SpyglassMixin, dj.Computed):
         ).fetch1("KEY")
 
         return lfp_band_key
+
+
+@schema
+class HexMazeThetaReference(SpyglassMixin, dj.Manual):
+    """A named set of reference electrodes for a HexMazeThetaV1 entry.
+
+    Lets you save the electrodes you chose for a layer (e.g. stratum radiatum) so that
+    later you can pull theta phase or power as the AVERAGE of those electrodes, without
+    re-running the selection. Averaging is done on the complex analytic signal (the
+    correct way to combine phases), then phase and power are derived from that average.
+
+    Typical usage:
+        # save a selection (electrode_ids can be ints or strings like "57")
+        HexMazeThetaReference.add_reference(
+            key={"nwb_file_name": "IM-1478_20220727_.nwb"},
+            reference_name="radiatum",
+            electrode_ids=[57, 58, 65],
+        )
+
+        # later, fetch the averaged theta phase / power for that set
+        ref = HexMazeThetaReference & {"nwb_file_name": "IM-1478_20220727_.nwb",
+                                       "reference_name": "radiatum"}
+        phase = ref.fetch1_reference_phase()   # radians [0, 2π], indexed by time
+        power = ref.fetch1_reference_power()    # amplitude², indexed by time
+    """
+
+    definition = """
+    -> HexMazeThetaV1
+    reference_name : varchar(64)    # label for this electrode set, e.g. "radiatum"
+    ---
+    electrode_ids  : blob           # list of electrode ids to average over
+    description="" : varchar(255)   # optional note about how the set was chosen
+    """
+
+    @classmethod
+    def add_reference(cls, key, reference_name, electrode_ids, description="", replace=False):
+        """Save a set of reference electrodes for one HexMazeThetaV1 entry.
+
+        Parameters
+        ----------
+        key : dict
+            Restriction that uniquely identifies one HexMazeThetaV1 row
+            (e.g. {"nwb_file_name": "IM-1478_20220727_.nwb"}).
+        reference_name : str
+            Label for this set (e.g. "radiatum"). Part of the primary key, so you can
+            store several named sets per session.
+        electrode_ids : list
+            Electrode ids to average over. Ints or strings ("57") both work.
+        description : str
+            Optional note (e.g. "k=6 cluster 0, stratum radiatum").
+        replace : bool
+            If True, overwrite an existing set stored under the same name.
+        """
+        theta_key = (HexMazeThetaV1 & key).fetch1("KEY")
+        cls.insert1(
+            {
+                **theta_key,
+                "reference_name": reference_name,
+                "electrode_ids": [int(e) for e in electrode_ids],
+                "description": description,
+            },
+            replace=replace,
+        )
+
+    def fetch1_reference_analytic(self) -> pd.Series:
+        """Complex analytic signal averaged across the saved reference electrodes."""
+        return (HexMazeThetaV1 & self).average_analytic_signal(self.fetch1("electrode_ids"))
+
+    def fetch1_reference_phase(self) -> pd.Series:
+        """Averaged theta phase (radians [0, 2π]) across the saved reference electrodes."""
+        return (HexMazeThetaV1 & self).average_theta_phase(self.fetch1("electrode_ids"))
+
+    def fetch1_reference_power(self) -> pd.Series:
+        """Averaged theta power (amplitude²) across the saved reference electrodes."""
+        return (HexMazeThetaV1 & self).average_theta_power(self.fetch1("electrode_ids"))
