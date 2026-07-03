@@ -166,6 +166,53 @@ class HexMazeDecodedPosition(SpyglassMixin, dj.Computed):
         return self.fetch_nwb()[0]["decoded_position"].set_index("time")
 
 
+def compute_aheadness(
+    df,
+    orientation_col="orientation",
+    position_cols=("position_x", "position_y"),
+    decode_cols=("decode_position_x", "decode_position_y"),
+):
+    """Raw "aheadness" = cos of the angle between the rat's heading and the
+    straight-line direction from the rat to the decoded position.
+
+        +1  -> decode is straight ahead of the rat
+         0  -> decode is 90 degrees off to the side
+        -1  -> decode is straight behind the rat
+
+    This is the raw quantity whose *sign* HexMazeDecodedPosition bakes into
+    `decode_distance` (decode_distance = sign(aheadness) * graph distance).
+    Returning the raw cosine lets you recompute the ahead/behind sign later with
+    any threshold or deadband you like, without touching the distance magnitude.
+
+    Note: this uses the straight-line (Euclidean) direction to the decode, so it
+    needs only the columns already stored in HexMazeDecodedPosition — no track
+    graph. It is therefore cheap (vectorized) but topology-blind: near a corner or
+    junction the straight line can cut through a wall, so the sign can disagree
+    with the graph-based one there. Along a straight arm the two agree.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Typically HexMazeDecodedPosition.fetch1_dataframe(). Must contain the
+        orientation, actual-position, and decoded-position columns below.
+    orientation_col : str
+        Column holding the rat's head direction, in radians.
+    position_cols, decode_cols : tuple[str, str]
+        (x, y) column names for the rat's actual position and the decoded position.
+
+    Returns
+    -------
+    pd.Series
+        cos(Δθ) per time point, aligned to df's index.
+    """
+    # Straight-line direction (radians) from the rat to the decoded position
+    direction_to_decode = np.arctan2(
+        df[decode_cols[1]] - df[position_cols[1]],
+        df[decode_cols[0]] - df[position_cols[0]],
+    )
+    # cos of the difference: how aligned the decode is with where the rat faces
+    return np.cos(df[orientation_col] - direction_to_decode)
+
 
 def assign_position_to_hex(positions_xy, hex_centroids, maze):
     """

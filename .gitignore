@@ -40,3 +40,11 @@ env/
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Don't track output!
+notebooks/analysis/figures/*
+*.mp4
+*.pdf
+*.png
+*.pkl
+*.csv
