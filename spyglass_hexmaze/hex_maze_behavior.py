@@ -64,19 +64,8 @@ def populate_all_hex_position():
     # Get all valid keys that can be used to populate the HexPositionSelection table
     all_valid_keys = HexPositionSelection.get_all_valid_keys()
 
-    # Insert each key into HexPositionSelection with renamed key field
-    for key in all_valid_keys:
-        selection_key = key.copy()
-        selection_key["pos_merge_id"] = selection_key.pop("merge_id")
-
-        # Skip inserting the key if it already exists in the table
-        if selection_key in HexPositionSelection:
-            continue
-        try:
-            HexPositionSelection.insert1(selection_key, skip_duplicates=True)
-            print(f"Inserted new key {selection_key} into HexPositionSelection")
-        except Exception as e:
-            print(f"Skipping insert for {selection_key}: {e}")
+    # Insert all valid keys into HexPositionSelection (existing keys are skipped)
+    HexPositionSelection.insert_valid_keys(all_valid_keys)
 
     # Populate HexPosition table and HexPath table
     HexPosition.populate()
@@ -97,19 +86,8 @@ def populate_hex_position(nwb_file_name):
         print(f"No valid HexPositionSelection keys found for {nwb_file_name}")
         return
 
-    # Insert each key into HexPositionSelection with renamed key field
-    for key in nwb_file_keys:
-        selection_key = key.copy()
-        selection_key["pos_merge_id"] = selection_key.pop("merge_id")
-
-        # Skip inserting the key if it already exists in the table
-        if selection_key in HexPositionSelection:
-            continue
-        try:
-            HexPositionSelection.insert1(selection_key, skip_duplicates=True)
-            print(f"Inserted new key {selection_key} into HexPositionSelection")
-        except Exception as e:
-            print(f"Skipping insert for {selection_key}: {e}")
+    # Insert the valid keys for this nwb into HexPositionSelection (existing keys skipped)
+    HexPositionSelection.insert_valid_keys(nwb_file_keys)
 
     # Only populate HexPosition with keys for this nwb
     selection_keys = (HexPositionSelection & {"nwb_file_name": nwb_file_name}).fetch(
@@ -420,6 +398,9 @@ class HexMazeChoice(SpyglassMixin, dj.Computed):
         return chosen_length, unchosen_length
 
     def make(self, key):
+        # Skip if already populated
+        if self & key:
+            return
         # Fetch the block + trial row
         trial_row = (HexMazeBlock().join_with_trial() & key).fetch1()
 
@@ -445,7 +426,8 @@ class HexMazeChoice(SpyglassMixin, dj.Computed):
                 "path_length_chosen": chosen_length,
                 "path_length_unchosen": unchosen_length,
                 "path_length_diff": chosen_length - unchosen_length,
-            }
+            },
+            skip_duplicates=True,
         )
 
 
@@ -601,6 +583,9 @@ class HexMazeTrialHistory(SpyglassMixin, dj.Computed):
     """
 
     def make(self, key):
+        # Skip if already populated
+        if self & key:
+            return
         # Create HexMazeTrialContext from trial key
         trial_context = HexMazeTrialContext(key)
 
@@ -651,7 +636,8 @@ class HexMazeTrialHistory(SpyglassMixin, dj.Computed):
                     if trial_context.num_trials_since_reward() is not None
                     else -1
                 ),
-            }
+            },
+            skip_duplicates=True,
         )
 
 
@@ -787,6 +773,9 @@ class HexCentroids(dj.Imported):
         }
 
     def make(self, key):
+        # Skip if already populated
+        if self & key:
+            return
         # Load hex centroids from the NWB file
         nwb_file_path = Nwbfile().get_abs_path(key["nwb_file_name"])
         with NWBHDF5IO(nwb_file_path, mode="r") as io:
@@ -856,7 +845,7 @@ class HexCentroids(dj.Imported):
         ]
 
         # Insert nwb_file_name into the HexCentroids table
-        self.insert1(key)
+        self.insert1(key, skip_duplicates=True)
         # Insert the hex centroids into the HexCentroidsPart part table
         self.HexCentroidsPart.insert(centroids_to_insert, skip_duplicates=True)
         self.HexCentroidsPart.insert(side_hex_centroids_to_insert, skip_duplicates=True)
@@ -877,56 +866,92 @@ class HexPositionSelection(SpyglassMixin, dj.Manual):
     ---
     """
 
+    @staticmethod
+    def _position_output_epoch(row):
+        """Epoch a PositionOutput part row belongs to.
+
+        Parts of PositionOutput identify their epoch differently: Trodes and Common
+        position store an interval_list_name like "pos 3 valid times", while DLC position
+        stores the `epoch` attribute directly. Returns the epoch, or None if neither is
+        present / parseable.
+        """
+        if row.get("epoch") is not None:
+            return int(row["epoch"])
+        match = re.match(r"pos (\d+) valid times", str(row.get("interval_list_name")))
+        return int(match.group(1)) if match else None
+
     @classmethod
     def get_all_valid_keys(cls, verbose=True):
         """
-        Return a list of valid composite keys (nwb_file_name, epoch, merge_id)
-        for sessions that have HexMazeBlock, PositionOutput, and HexCentroids data.
-        These keys can be used to populate the HexPositionSelection table.
+        Return a list of valid composite keys (pos_merge_id, nwb_file_name, epoch) that can
+        be inserted into HexPositionSelection. A key is valid when the session has
+        HexMazeBlock data and HexCentroids, and there is a PositionOutput entry for that
+        (session, epoch).
+
+        We read the epoch straight from each PositionOutput part.
 
         Use verbose=False to suppress print output.
         """
+        # (session, epoch) pairs that have hex maze behavior, limited to sessions that also
+        # have HexCentroids (both are required to assign position to hexes)
+        block_nwbs, block_epochs = HexMazeBlock.fetch("nwb_file_name", "epoch")
+        hex_sessions = set(block_nwbs)
+        centroid_sessions = set(HexCentroids.fetch("nwb_file_name"))
+        hex_epochs = {
+            (nwb, epoch)
+            for nwb, epoch in zip(block_nwbs, block_epochs)
+            if nwb in centroid_sessions
+        }
+
+        # Walk every PositionOutput part, asking each for the attributes it actually has
+        # (Trodes/Common have interval_list_name, DLC has epoch), and keep the entries whose
+        # (session, epoch) is a real hex maze epoch.
         all_valid_keys = []
-
-        # Loop through all unique nwbfiles in the HexMazeBlock table
-        for nwb_file_name in set(HexMazeBlock.fetch("nwb_file_name")):
-            key = {"nwb_file_name": nwb_file_name}
-
-            # Make sure an entry in HexCentroids exists for this nwbfile
-            if not len(HexCentroids & {"nwb_file_name": nwb_file_name}):
-                if verbose:
-                    print(
-                        f"No HexCentroids entry found for nwbfile {nwb_file_name}, skipping."
-                    )
-                continue
-
-            # Loop through all unique epochs
-            for epoch in set((HexMazeBlock & key).fetch("epoch")):
-                position_output_key = {
-                    "nwb_file_name": key["nwb_file_name"],
-                    "interval_list_name": f"pos {epoch} valid times",
-                }
-
-                # Fetch the merge_ids for this nwb + epoch combination (if it exists in the PositionOutput table)
-                try:
-                    merge_ids = (
-                        PositionOutput.merge_get_part(position_output_key)
-                    ).fetch("KEY")
-                except ValueError:
-                    if verbose:
-                        print(
-                            f"No PositionOutput entry found for {position_output_key}, skipping."
-                        )
+        for part in PositionOutput().parts(as_objects=True):
+            names = part.heading.names
+            if "nwb_file_name" not in names:
+                continue  # e.g. a pose part with no session link
+            attrs = ["merge_id", "nwb_file_name"]
+            attrs += [a for a in ("epoch", "interval_list_name") if a in names]
+            for row in part.fetch(*attrs, as_dict=True):
+                epoch = cls._position_output_epoch(row)
+                if epoch is None or (row["nwb_file_name"], epoch) not in hex_epochs:
                     continue
-
-                for merge_id in merge_ids:
-                    composite_key = {
-                        "nwb_file_name": nwb_file_name,
+                all_valid_keys.append(
+                    {
+                        "pos_merge_id": row["merge_id"],
+                        "nwb_file_name": row["nwb_file_name"],
                         "epoch": epoch,
-                        **merge_id,
                     }
-                    all_valid_keys.append(composite_key)
+                )
+
+        if verbose:
+            n_sessions = len({k["nwb_file_name"] for k in all_valid_keys})
+            print(
+                f"Found {len(all_valid_keys)} valid HexPositionSelection key(s) "
+                f"across {n_sessions} session(s)."
+            )
+            for nwb in sorted(hex_sessions - centroid_sessions):
+                print(f"  No HexCentroids for {nwb}, skipping.")
         return all_valid_keys
+
+    @classmethod
+    def insert_valid_keys(cls, keys, verbose=True):
+        """
+        Insert the given HexPositionSelection keys, skipping any that already exist.
+        Each key should have pos_merge_id, nwb_file_name, and epoch
+        (i.e. the keys returned by get_all_valid_keys).
+        """
+        for key in keys:
+            # Skip inserting the key if it already exists in the table
+            if key in cls:
+                continue
+            try:
+                cls.insert1(key, skip_duplicates=True)
+                if verbose:
+                    print(f"Inserted new key {key} into HexPositionSelection")
+            except Exception as e:
+                print(f"Skipping insert for {key}: {e}")
 
 
 @schema
@@ -939,6 +964,9 @@ class HexPosition(SpyglassMixin, dj.Computed):
     """
 
     def make(self, key):
+        # Skip if already populated
+        if self & key:
+            return
         # Get a dict of hex: (x, y) centroid in cm for this nwbfile
         hex_centroids = HexCentroids.get_hex_centroids_dict_cm(key)
 
@@ -1041,7 +1069,7 @@ class HexPosition(SpyglassMixin, dj.Computed):
         )
         # Create an entry in the AnalysisNwbfile table (like insert1)
         AnalysisNwbfile().add(key["nwb_file_name"], key["analysis_file_name"])
-        self.insert1(key)
+        self.insert1(key, skip_duplicates=True)
 
     def fetch1_dataframe(self):
         return self.fetch_nwb()[0]["hex_assignment"].set_index("time")
@@ -1122,6 +1150,9 @@ class HexPath(SpyglassMixin, dj.Computed):
     """
 
     def make(self, key):
+        # Skip if already populated
+        if self & key:
+            return
         # Get hex position dataframe for this nwb+epoch
         hex_position_df = (HexPosition & key).fetch1_dataframe()
 
@@ -1294,7 +1325,7 @@ class HexPath(SpyglassMixin, dj.Computed):
         )
         # Create an entry in the AnalysisNwbfile table (like insert1)
         AnalysisNwbfile().add(key["nwb_file_name"], key["analysis_file_name"])
-        self.insert1(key)
+        self.insert1(key, skip_duplicates=True)
 
     def fetch1_dataframe(self):
         return self.fetch_nwb()[0]["hex_path"]
