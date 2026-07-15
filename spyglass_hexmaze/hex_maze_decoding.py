@@ -59,6 +59,65 @@ except ImportError:
 schema = dj.schema("hex_maze_decoding")
 
 
+def _decode_interval_epoch(nwb_file_name, decoding_interval, run_intervals):
+    """Resolve which epoch a decode belongs to, from its decoding_interval name.
+
+    Decodes name their interval a few different ways:
+      - the run interval itself: "00_r1" (Berke) or "07_r4" (Frank)
+      - a derived run interval: "01_r1_noPreTrialTimes" (run interval, pre-trial times removed)
+      - an interval named for its epoch: "epoch3_block2", "epoch7_nonLocal_ALL"
+
+    run_intervals maps {nwb_file_name: {interval_list_name: epoch}} (from TaskEpoch).
+    Returns the epoch number, or None if the interval can't be placed in an epoch.
+    """
+    name = str(decoding_interval)
+    # Run interval, exact or with a suffix like "_noPreTrialTimes"
+    for interval, epoch in run_intervals.get(nwb_file_name, {}).items():
+        if name.startswith(interval):
+            return epoch
+    # Interval that names its epoch up front (block / barrier shift / nonlocal decodes)
+    match = re.match(r"epoch(\d+)_", name)
+    return int(match.group(1)) if match else None
+
+
+def valid_decoded_position_keys():
+    """Every real (decoding_merge_id, nwb_file_name, epoch) key for HexMazeDecodedPosition.
+
+    Pairs each DecodingOutput entry that belongs to a hex maze session with the single
+    epoch its decoding_interval belongs to. Used as the key_source (see below) so that a
+    blank .populate() only considers real (decode, epoch) pairs instead of the full
+    DecodingOutput x TaskEpoch cross product.
+    """
+    hex_sessions = set(HexMazeBlock.fetch("nwb_file_name"))
+
+    # Build {nwb_file_name: {run interval name: epoch}} from TaskEpoch
+    run_intervals = {}
+    for nwb, epoch, interval in zip(
+        *(TaskEpoch & [{"nwb_file_name": s} for s in hex_sessions]).fetch(
+            "nwb_file_name", "epoch", "interval_list_name"
+        )
+    ):
+        run_intervals.setdefault(nwb, {})[interval] = epoch
+
+    # Walk the DecodingOutput parts for each decode's nwb_file_name + decoding_interval.
+    # (We can't use merge_fetch here because parts key on different attributes.)
+    keys = []
+    for part in DecodingOutput().parts(as_objects=True):
+        if "nwb_file_name" not in part.heading.names:
+            continue
+        for merge_id, nwb, interval in zip(
+            *part.fetch("merge_id", "nwb_file_name", "decoding_interval")
+        ):
+            if nwb not in hex_sessions:
+                continue
+            epoch = _decode_interval_epoch(nwb, interval, run_intervals)
+            if epoch is not None:
+                keys.append(
+                    {"decoding_merge_id": merge_id, "nwb_file_name": nwb, "epoch": epoch}
+                )
+    return keys
+
+
 @schema
 class HexMazeDecodedPosition(SpyglassMixin, dj.Computed):
     """
@@ -76,7 +135,21 @@ class HexMazeDecodedPosition(SpyglassMixin, dj.Computed):
     decoded_position_object_id: varchar(128)
     """
 
+    @property
+    def key_source(self):
+        # DecodingOutput and TaskEpoch share no attribute, so DataJoint's default
+        # key_source is their full cross product (every decode x every epoch). Restrict it
+        # to the real (decode, epoch) pairs (each decode paired with the epoch its
+        # decoding_interval actually belongs to) so a blank .populate() works instead
+        # of trying to populate every single entry in DecodingOutput
+        cross = DecodingOutput.proj(decoding_merge_id="merge_id") * TaskEpoch
+        # .proj() drops TaskEpoch's secondary columns so key_source is just the primary key
+        return (cross & valid_decoded_position_keys()).proj()
+
     def make(self, key):
+        # Skip if already populated
+        if self & key:
+            return
         # Get decode results
         decode_key = {"merge_id": key["decoding_merge_id"]}
         results = DecodingOutput.fetch_results(decode_key)
@@ -160,7 +233,7 @@ class HexMazeDecodedPosition(SpyglassMixin, dj.Computed):
             )
             key["analysis_file_name"] = builder.analysis_file_name
 
-        self.insert1(key)
+        self.insert1(key, skip_duplicates=True)
 
     def fetch1_dataframe(self):
         return self.fetch_nwb()[0]["decoded_position"].set_index("time")
@@ -274,6 +347,9 @@ class HexMazeDecodedPositionHex(SpyglassMixin, dj.Computed):
     """
 
     def make(self, key):
+        # Skip if already populated
+        if self & key:
+            return
         # Get a dict of hex: (x, y) centroid in cm for this nwbfile
         hex_centroids = HexCentroids.get_hex_centroids_dict_cm(key)
 
@@ -353,7 +429,7 @@ class HexMazeDecodedPositionHex(SpyglassMixin, dj.Computed):
             key["hex_assignment_object_id"] = builder.add_nwb_object(combined_df, "hex_assignment")
             key["analysis_file_name"] = builder.analysis_file_name
 
-        self.insert1(key)
+        self.insert1(key, skip_duplicates=True)
 
     _drop_cols = [
         "hex_including_sides", "distance_from_centroid",
@@ -385,6 +461,9 @@ class HexMazeDecodedHexPath(SpyglassMixin, dj.Computed):
     """
 
     def make(self, key):
+        # Skip if already populated
+        if self & key:
+            return
         # Get hex position dataframe for this nwb+epoch
         hex_position_df = (HexMazeDecodedPositionHex & key).fetch1_dataframe()
         nwb_file = key["nwb_file_name"]
@@ -555,7 +634,7 @@ class HexMazeDecodedHexPath(SpyglassMixin, dj.Computed):
             # File automatically registered on exit!
             key["analysis_file_name"] = builder.analysis_file_name
 
-        self.insert1(key)
+        self.insert1(key, skip_duplicates=True)
 
     def fetch1_dataframe(self):
         return self.fetch_nwb()[0]["hex_path"]
@@ -734,6 +813,9 @@ class HexMazeDecodedPositionHexAnnotated(SpyglassMixin, dj.Computed):
     """
 
     def make(self, key):
+        # Skip if already populated
+        if self & key:
+            return
         # Get hex position dataframe for this nwb+epoch
         hex_position_df = (HexMazeDecodedPositionHex & key).fetch1_dataframe()
         nwb_file = key["nwb_file_name"]
@@ -914,7 +996,7 @@ class HexMazeDecodedPositionHexAnnotated(SpyglassMixin, dj.Computed):
             key["annotated_hex_object_id"] = builder.add_nwb_object(hex_position_df, "annotated_hex")
             key["analysis_file_name"] = builder.analysis_file_name
 
-        self.insert1(key)
+        self.insert1(key, skip_duplicates=True)
 
     def fetch1_dataframe(self):
         return self.fetch_nwb()[0]["annotated_hex"].set_index("time")
@@ -939,7 +1021,20 @@ class HexMazeDecodedPositionAll(SpyglassMixin, dj.Computed):
     decoded_position_all_object_id: varchar(128)
     """
 
+    @property
+    def key_source(self):
+        # Same cross-product issue as HexMazeDecodedPosition (DecodingOutput and TaskEpoch
+        # share no attribute), plus HexCentroids -- which joins cleanly on nwb_file_name and
+        # so naturally limits us to sessions that have centroids. Reuse the real
+        # (decode, epoch) pairs to restrict the cross product.
+        cross = DecodingOutput.proj(decoding_merge_id="merge_id") * TaskEpoch * HexCentroids
+        # .proj() drops the joined secondary columns so key_source is just the primary key
+        return (cross & valid_decoded_position_keys()).proj()
+
     def make(self, key):
+        # Skip if already populated
+        if self & key:
+            return
         decode_key = {"merge_id": key["decoding_merge_id"]}
 
         # Get decode results
@@ -1077,7 +1172,7 @@ class HexMazeDecodedPositionAll(SpyglassMixin, dj.Computed):
             )
             key["analysis_file_name"] = builder.analysis_file_name
 
-        self.insert1(key)
+        self.insert1(key, skip_duplicates=True)
 
     _drop_cols = [
         "hex_including_sides", "distance_from_centroid",
@@ -1110,6 +1205,9 @@ class HexMazeDecodedHexPathBarrierChange(SpyglassMixin, dj.Computed):
     """
 
     def make(self, key):
+        # Skip if already populated
+        if self & key:
+            return
         nwb_file = key["nwb_file_name"]
         epoch = key["epoch"]
 
@@ -1228,7 +1326,7 @@ class HexMazeDecodedHexPathBarrierChange(SpyglassMixin, dj.Computed):
             )
             key["analysis_file_name"] = builder.analysis_file_name
 
-        self.insert1(key)
+        self.insert1(key, skip_duplicates=True)
 
     def fetch1_dataframe(self):
         return self.fetch_nwb()[0]["barrier_change_hex_path"]
@@ -1258,6 +1356,9 @@ class HexMazeJunctionDecode(SpyglassMixin, dj.Computed):
     """
 
     def make(self, key):
+        # Skip if already populated
+        if self & key:
+            return
         # Get per-timepoint annotated dataframe from parent table
         annotated_df = (HexMazeDecodedPositionHexAnnotated & key).fetch1_dataframe()
         nwb_file = key["nwb_file_name"]
@@ -1458,7 +1559,7 @@ class HexMazeJunctionDecode(SpyglassMixin, dj.Computed):
             )
             key["analysis_file_name"] = builder.analysis_file_name
 
-        self.insert1(key)
+        self.insert1(key, skip_duplicates=True)
 
     def fetch1_dataframe(self):
         return self.fetch_nwb()[0]["junction_decode"].set_index("time")
@@ -1508,6 +1609,9 @@ class HexMazeThetaV1(SpyglassMixin, dj.Computed):
     """
 
     def make(self, key):
+        # Skip if already populated
+        if self & key:
+            return
         # Get the list of electrodes selected for this LFP band entry
         electrode_ids = sorted(
             (LFPBandSelection.LFPBandElectrode & key).fetch("electrode_id").tolist()
@@ -1558,7 +1662,7 @@ class HexMazeThetaV1(SpyglassMixin, dj.Computed):
             )
             key["analysis_file_name"] = builder.analysis_file_name
 
-        self.insert1(key)
+        self.insert1(key, skip_duplicates=True)
 
     def fetch1_analytic_signal(self) -> pd.DataFrame:
         """Return the analytic signal DataFrame, indexed by time.
