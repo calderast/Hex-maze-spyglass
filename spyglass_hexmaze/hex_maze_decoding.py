@@ -21,6 +21,7 @@ from spyglass_hexmaze.hex_maze_behavior import HexCentroids, HexMazeBlock
 
 try:
     from hexmaze import (
+        are_points_in_maze,
         classify_maze_hexes,
         divide_into_thirds,
         get_all_choice_points,
@@ -39,6 +40,7 @@ try:
 except ImportError:
     logger.error("required hexmaze functions could not be imported")
     (
+        are_points_in_maze,
         classify_maze_hexes,
         divide_into_thirds,
         get_all_choice_points,
@@ -53,7 +55,7 @@ except ImportError:
         maze_to_graph,
         get_hex_distance,
         plot_hex_maze,
-    ) = (None,) * 14
+    ) = (None,) * 15
 
 
 schema = dj.schema("hex_maze_decoding")
@@ -287,40 +289,135 @@ def compute_aheadness(
     return np.cos(df[orientation_col] - direction_to_decode)
 
 
-def assign_position_to_hex(positions_xy, hex_centroids, maze):
+def get_open_hexes(maze):
+    """All reachable open hexes in the maze (1-49 minus barriers and unreachable hexes)."""
+    return set(range(1, 50)) - maze_to_barrier_set(maze) - get_unreachable_hexes(maze)
+
+
+def get_epoch_blocks_in_order(nwb_file_name, epoch):
+    """
+    Every block in this epoch, in chronological order, with its time bounds and open hexes.
+
+    Block numbers count up within an epoch, so sorting by block number gives us chronological
+    order. This is what lets us ask "was this hex open earlier in the epoch, and how many
+    blocks ago?" while looking only at the past - a hex that is a barrier now and only opens
+    up in some later block should not count as having been open.
+
+    Note that "open" excludes unreachable hexes as well as barriers (see get_open_hexes), so
+    a hex walled off into an unreachable island counts as blocked for as long as it is
+    stranded, exactly like a hex with a barrier on it.
+
+    Parameters:
+        nwb_file_name (str): The session the epoch belongs to
+        epoch (int): The epoch to get blocks for
+
+    Returns:
+        list[dict]: One dict per block, ordered by block number, with keys
+            "block", "start_time", "end_time", and "open_hexes" (set[int])
+    """
+    blocks = []
+    for block in HexMazeBlock & {"nwb_file_name": nwb_file_name, "epoch": epoch}:
+        # Get the block start and end times
+        start_time, end_time = (
+            sgc.IntervalList
+            & {
+                "nwb_file_name": nwb_file_name,
+                "interval_list_name": block["interval_list_name"],
+            }
+        ).fetch1("valid_times")[0]
+
+        blocks.append(
+            {
+                "block": block["block"],
+                "start_time": start_time,
+                "end_time": end_time,
+                "open_hexes": get_open_hexes(block["config_id"]),
+            }
+        )
+
+    return sorted(blocks, key=lambda b: b["block"])
+
+
+def blocks_ago_label(blocks_ago):
+    """
+    Human-readable label for how recently a hex was open, given the number of blocks since
+    it was last open (0 = open right now, None = it has not been open yet this epoch).
+
+    Returns one of "open", "open_1_block_ago", "open_2_blocks_ago", ..., or "never_open".
+    """
+    if blocks_ago is None:
+        return "never_open"
+    if blocks_ago == 0:
+        return "open"
+    # "1 block ago" but "2 blocks ago"
+    return f"open_{blocks_ago}_block_ago" if blocks_ago == 1 else f"open_{blocks_ago}_blocks_ago"
+
+
+def assign_position_to_hex(positions_xy, hex_centroids, maze=None, allowed_hexes=None):
     """
     Assign each (x, y) position to the nearest hex.
-    
+
+    By default, only hexes the rat could actually occupy are considered. Which hexes those
+    are depends on what you pass:
+        - maze: use the hexes open in that maze config (barriers and unreachable hexes excluded)
+        - allowed_hexes: use exactly the hexes you specify (e.g. every hex open at any point
+          in the epoch so far, built up from get_epoch_blocks_in_order)
+        - neither: use every hex in hex_centroids, i.e. assign to the nearest hex regardless
+          of whether it was ever open
+
     Parameters:
         positions_xy: np.ndarray, shape (n_positions, 2)
         hex_centroids: dict mapping hex_id to (x, y) centroid (including side hexes)
         maze: hex maze config (to exclude hexes that are barriers or unreachable)
+        allowed_hexes: iterable of hex ids (1-49) to restrict assignment to.
+            Takes precedence over maze if both are given.
 
     Returns:
         core_hex (list[int]): Closest core hex (1-49) for each hex for each xy position
         hex_including_sides (list[str]): Closest hex (including side hexes) for each xy position
         distance_from_centroid (np.ndarray): Distance between each xy position and centroid of assigned hex
     """
-    
-    # Exclude hexes that are barriers or unreachable so we don't assign position to them
-    exclude_hexes = {str(h) for h in maze_to_barrier_set(maze) | get_unreachable_hexes(maze)}
-    centroids_to_use = {hex: coords for hex, coords in hex_centroids.items() if hex not in exclude_hexes}
+
+    # Figure out which hexes we're allowed to assign positions to.
+    # hex_centroids keys are strings ("4", "4_left"), so compare as strings.
+    # Note that the side half-hexes ("4_left") are always kept - their core hexes 4, 49, and
+    # 48 sit next to the reward ports and can never be barriers.
+    if allowed_hexes is not None:
+        keep_hexes = {str(h) for h in allowed_hexes}
+        centroids_to_use = {
+            hex: coords for hex, coords in hex_centroids.items()
+            if re.match(r"\d+", hex).group() in keep_hexes
+        }
+    elif maze is not None:
+        # Exclude hexes that are barriers or unreachable so we don't assign position to them
+        exclude_hexes = {str(h) for h in maze_to_barrier_set(maze) | get_unreachable_hexes(maze)}
+        centroids_to_use = {hex: coords for hex, coords in hex_centroids.items() if hex not in exclude_hexes}
+    else:
+        # No restriction: assign to the nearest hex out of all of them
+        centroids_to_use = dict(hex_centroids)
 
     # Convert centroids to array for fast computation
     hex_ids = list(centroids_to_use.keys())
     hex_coords = np.array(list(centroids_to_use.values())) # shape (n_hexes, 2)
 
-    # Compute distances from each x, y position to each hex centroid
-    diffs = positions_xy[:, np.newaxis, :] - hex_coords[np.newaxis, :, :] # shape (n_positions, n_hexes, 2)
-    dists = np.linalg.norm(diffs, axis=2) # shape (n_positions, n_hexes)
+    # Compute distances from each x, y position to each hex centroid, then take the closest.
+    # We do this in chunks of positions because the intermediate distance array has shape
+    # (n_positions, n_hexes, 2) - assigning a whole session at once would otherwise need
+    # hundreds of MB of memory. Chunking gives identical results using a fixed amount.
+    chunk_size = 50_000
+    closest_idx = np.empty(len(positions_xy), dtype=int)
+    distance_from_centroid = np.empty(len(positions_xy))
+    for start in range(0, len(positions_xy), chunk_size):
+        chunk = positions_xy[start : start + chunk_size]
+        diffs = chunk[:, np.newaxis, :] - hex_coords[np.newaxis, :, :] # shape (n_chunk, n_hexes, 2)
+        dists = np.linalg.norm(diffs, axis=2) # shape (n_chunk, n_hexes)
+        # Find the closest hex centroid, and its distance, for each x, y position
+        closest_idx[start : start + len(chunk)] = np.argmin(dists, axis=1)
+        distance_from_centroid[start : start + len(chunk)] = np.min(dists, axis=1)
 
-    # Find the closest hex centroid for each x, y position
-    closest_idx = np.argmin(dists, axis=1)
     closest_hex_including_sides = [hex_ids[i] for i in closest_idx]
-    
-    # Calculate the distance from the centroid for each closest hex
-    distance_from_centroid = np.min(dists, axis=1)
-    
+
+
     # Closest_hex_including_sides includes ids for the 6 side hexes next to the reward ports (e.g '4_left')
     # Closest_core_hex assigns the side hexes to their "core" hex (e.g. '4_left' and '4_right') become 4
     closest_core_hex = [int(re.match(r"\d+", h).group()) for h in closest_hex_including_sides]
@@ -443,6 +540,198 @@ class HexMazeDecodedPositionHex(SpyglassMixin, dj.Computed):
     def fetch1_dataframe_full(self):
         # Return the full dataframe if we need more precise hex assignment info
         return self.fetch_nwb()[0]["hex_assignment"].set_index("time")
+
+
+@schema
+class HexMazeDecodedPositionHexV2(SpyglassMixin, dj.Computed):
+    """
+    Extension of HexMazeDecodedPositionHex with alternative hex assignments.
+
+    HexMazeDecodedPositionHex assigns each position to the nearest hex that is open in the
+    current block, which means a decode that lands on a barrier hex gets snapped to whatever
+    open hex happens to be closest. That is the right thing to do most of the time, but it
+    hides the cases we sometimes care about: decodes of locations that used to be open
+    (barrier change sessions), decodes of locations that were never open, and decodes that
+    fell off the maze entirely.
+
+    History here is scoped to the epoch, and looks only at the past: "open at some point"
+    always means open in the current block or an earlier block of the same epoch, never a
+    later one and never a different epoch. A hex that is blocked in block 3 and only opens up
+    in block 4 counts as never having been open during block 3.
+
+    This table keeps every column from HexMazeDecodedPositionHex and adds:
+
+    Assignment allowing any hex open at any point in the epoch so far
+    (the union of open hexes over every block up to and including the current one):
+        decode_hex_epoch_open, decode_hex_epoch_open_including_sides,
+        decode_epoch_open_distance_from_centroid
+
+    Assignment allowing all hexes, regardless of whether they were ever open:
+        hex_any, hex_any_including_sides, any_distance_from_centroid
+        decode_hex_any, decode_hex_any_including_sides, decode_any_distance_from_centroid
+
+    Whether the position falls inside the maze's physical footprint (1 = yes, 0 = no):
+        in_maze, decode_in_maze
+
+    How recently the decode's true nearest hex (decode_hex_any) was last open, as of the
+    block the decode happened in:
+        decode_hex_blocks_since_open: 0 if the hex is open in the current block, N if the
+            most recent block it was open in was N blocks ago, -1 if it has not been open
+            yet this epoch, and -100 for timepoints outside any block.
+        decode_hex_open_status: the same thing as a label - "open", "open_1_block_ago",
+            "open_2_blocks_ago", ..., "never_open", or "None" outside any block.
+
+    Note that hex_any, decode_hex_any, in_maze, and decode_in_maze do not depend on the maze
+    config, so they are filled for every timepoint in the decode. The epoch-open and
+    open-status columns do depend on which block we are in, so (like the parent table's
+    columns) they are only filled during blocks. In practice a decode basically always falls
+    inside a block, so the outside-block defaults are just a safety net.
+    """
+
+    definition = """
+    -> HexMazeDecodedPositionHex
+    ---
+    -> custom_AnalysisNwbfile
+    hex_assignment_v2_object_id: varchar(128)
+    """
+
+    def make(self, key):
+        # Skip if already populated
+        if self & key:
+            return
+
+        # Get the full hex assignment dataframe from the parent table (we keep all of its
+        # columns, including the "including sides" / "distance from centroid" detail columns)
+        combined_df = (HexMazeDecodedPositionHex & key).fetch1_dataframe_full()
+
+        # Get a dict of hex: (x, y) centroid in cm for this nwbfile.
+        # hex_centroids includes the 6 side half-hexes next to the reward ports (e.g. "4_left");
+        # core_hex_centroids has just the 49 real hexes, keyed by int, which is what the
+        # maze bounding box needs (it infers hex size from centroid spacing).
+        hex_centroids = HexCentroids.get_hex_centroids_dict_cm(key)
+        core_hex_centroids = HexCentroids.get_core_hex_centroids_dict_cm(key)
+
+        actual_xy = combined_df[["position_x", "position_y"]].to_numpy()
+        decode_xy = combined_df[["decode_position_x", "decode_position_y"]].to_numpy()
+
+        # Assign actual and decoded position to the nearest hex out of all hexes, whether or
+        # not that hex was ever open (no maze/allowed_hexes restriction). This doesn't depend
+        # on the maze config, so unlike the parent table we can do it in one pass over the
+        # whole session instead of block by block.
+        any_hex, any_incl_sides, any_dist = assign_position_to_hex(actual_xy, hex_centroids)
+        combined_df["hex_any"] = any_hex
+        combined_df["hex_any_including_sides"] = any_incl_sides
+        combined_df["any_distance_from_centroid"] = any_dist
+
+        decode_any_hex, decode_any_incl_sides, decode_any_dist = assign_position_to_hex(
+            decode_xy, hex_centroids
+        )
+        combined_df["decode_hex_any"] = decode_any_hex
+        combined_df["decode_hex_any_including_sides"] = decode_any_incl_sides
+        combined_df["decode_any_distance_from_centroid"] = decode_any_dist
+
+        # Flag positions that fall outside the physical footprint of the maze
+        # (stored as 1/0 instead of True/False to keep the NWB dtype simple)
+        combined_df["in_maze"] = are_points_in_maze(actual_xy, core_hex_centroids).astype(int)
+        combined_df["decode_in_maze"] = are_points_in_maze(decode_xy, core_hex_centroids).astype(int)
+
+        # The remaining columns depend on which blocks of this epoch have already happened,
+        # so we walk the epoch's blocks in chronological order. A decode basically always
+        # falls inside a block, but any timepoint that doesn't keeps these defaults
+        # (-100 and "None", as elsewhere, to avoid nan/HDF5 datatype issues).
+        combined_df["decode_hex_epoch_open"] = -100
+        combined_df["decode_hex_epoch_open_including_sides"] = "None"
+        combined_df["decode_epoch_open_distance_from_centroid"] = -100.0
+        combined_df["decode_hex_blocks_since_open"] = -100
+        combined_df["decode_hex_open_status"] = "None"
+
+        # Every block in this epoch, oldest first. History does not carry across epochs:
+        # each epoch starts over with nothing having been open yet.
+        epoch_blocks = get_epoch_blocks_in_order(key["nwb_file_name"], key["epoch"])
+
+        # As we walk forward through blocks, remember the most recent block each hex was open
+        # in. Because we only ever look at what we have already walked past, no information
+        # from future blocks can leak in.
+        last_open_block_idx = {}  # hex -> index of the most recent block it was open in
+
+        for block_idx, block in enumerate(epoch_blocks):
+            # Record this block's open hexes first, so a hex open right now is "0 blocks ago"
+            for open_hex in block["open_hexes"]:
+                last_open_block_idx[open_hex] = block_idx
+
+            # Filter to only include times for this block
+            block_pos = combined_df.loc[block["start_time"]:block["end_time"]]
+            if block_pos.empty:
+                continue
+
+            # Every hex open in this block or any earlier block of this epoch
+            open_so_far = set(last_open_block_idx)
+
+            # How many blocks back each hex was last open (0 = open in this block)
+            blocks_since_open = {h: block_idx - idx for h, idx in last_open_block_idx.items()}
+
+            # Assign decoded position to the nearest hex that has been open at some point so far
+            decode_xy_block = block_pos[["decode_position_x", "decode_position_y"]].to_numpy()
+            epoch_hex, epoch_incl_sides, epoch_dist = assign_position_to_hex(
+                decode_xy_block, hex_centroids, allowed_hexes=open_so_far
+            )
+            combined_df.loc[block_pos.index, "decode_hex_epoch_open"] = epoch_hex
+            combined_df.loc[block_pos.index, "decode_hex_epoch_open_including_sides"] = epoch_incl_sides
+            combined_df.loc[block_pos.index, "decode_epoch_open_distance_from_centroid"] = epoch_dist
+
+            # Record how recently the decode's true nearest hex was last open, as a number of
+            # blocks (-1 if it has not been open yet this epoch) and as a readable label
+            combined_df.loc[block_pos.index, "decode_hex_blocks_since_open"] = [
+                blocks_since_open.get(h, -1) for h in block_pos["decode_hex_any"]
+            ]
+            combined_df.loc[block_pos.index, "decode_hex_open_status"] = [
+                blocks_ago_label(blocks_since_open.get(h)) for h in block_pos["decode_hex_any"]
+            ]
+
+        # Rearrange columns: actual position/hex first, then decoded position/hex
+        actual_cols = ["position_x", "position_y", "orientation", "velocity_x", "velocity_y", "speed",
+                       "hex", "hex_including_sides", "distance_from_centroid",
+                       "hex_any", "hex_any_including_sides", "any_distance_from_centroid", "in_maze"]
+        decode_cols = ["decode_position_x", "decode_position_y",
+                       "decode_hex", "decode_hex_including_sides", "decode_distance_from_centroid",
+                       "decode_hex_epoch_open", "decode_hex_epoch_open_including_sides",
+                       "decode_epoch_open_distance_from_centroid",
+                       "decode_hex_any", "decode_hex_any_including_sides",
+                       "decode_any_distance_from_centroid",
+                       "decode_hex_blocks_since_open", "decode_hex_open_status", "decode_in_maze",
+                       "decode_distance", "decode_hex_distance", "hpd_thresh", "spatial_cov"]
+        combined_df = combined_df[[c for c in actual_cols + decode_cols if c in combined_df.columns]]
+
+        # Save time as a column instead of index (NWB requires integer index)
+        # reset_index() puts time as the first column automatically
+        combined_df = combined_df.reset_index()
+
+        # Create an AnalysisNwbfile with a link to the original nwb and add the df
+        with custom_AnalysisNwbfile().build(key["nwb_file_name"]) as builder:
+            key["hex_assignment_v2_object_id"] = builder.add_nwb_object(
+                combined_df, "hex_assignment_v2"
+            )
+            key["analysis_file_name"] = builder.analysis_file_name
+
+        self.insert1(key, skip_duplicates=True)
+
+    # The "including sides" and "distance from centroid" columns are extra precision that
+    # most analyses don't need, so fetch1_dataframe drops them (same as the parent table)
+    _drop_cols = [
+        "hex_including_sides", "distance_from_centroid",
+        "hex_any_including_sides", "any_distance_from_centroid",
+        "decode_hex_including_sides", "decode_distance_from_centroid",
+        "decode_hex_epoch_open_including_sides", "decode_epoch_open_distance_from_centroid",
+        "decode_hex_any_including_sides", "decode_any_distance_from_centroid",
+    ]
+
+    def fetch1_dataframe(self):
+        # Return the clean dataframe (drop hex including sides, distance from centroid)
+        return self.fetch1_dataframe_full().drop(columns=self._drop_cols)
+
+    def fetch1_dataframe_full(self):
+        # Return the full dataframe if we need more precise hex assignment info
+        return self.fetch_nwb()[0]["hex_assignment_v2"].set_index("time")
 
 
 @schema
@@ -850,10 +1139,6 @@ class HexMazeDecodedPositionHexAnnotated(SpyglassMixin, dj.Computed):
         port_dist_cache = {}      # (maze, port) -> {hex: distance}
         choice_dist_cache = {}    # (maze, start_port) -> {hex: signed_distance}
 
-        def _get_open_hexes(maze):
-            """All reachable open hexes in the maze (1-49 minus barriers and unreachable)."""
-            return set(range(1, 50)) - maze_to_barrier_set(maze) - get_unreachable_hexes(maze)
-
         def _get_hex_type_map(maze):
             """Hex -> classification (optimal, non_optimal, or dead_end)."""
             if maze not in hex_type_cache:
@@ -881,7 +1166,7 @@ class HexMazeDecodedPositionHexAnnotated(SpyglassMixin, dj.Computed):
             if cache_key not in port_dist_cache:
                 port_dist_cache[cache_key] = {
                     h: get_hexes_from_port(maze, start_hex=h, reward_port=port)
-                    for h in _get_open_hexes(maze)
+                    for h in get_open_hexes(maze)
                 }
             return port_dist_cache[cache_key]
 
@@ -904,7 +1189,7 @@ class HexMazeDecodedPositionHexAnnotated(SpyglassMixin, dj.Computed):
                 choice_dist_cache[cache_key] = {
                     h: min(get_hex_distance(maze=maze, start_hex=h, target_hex=cp) for cp in choice_points)
                     * (-1 if hex_to_section.get(h) == start_section else 1)
-                    for h in _get_open_hexes(maze)
+                    for h in get_open_hexes(maze)
                 }
             return choice_dist_cache[cache_key]
 
