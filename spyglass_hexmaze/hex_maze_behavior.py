@@ -8,31 +8,19 @@ import spyglass.common as sgc
 from pynwb import NWBHDF5IO
 from spyglass.common import AnalysisNwbfile, IntervalList, Nwbfile
 from spyglass.position import PositionOutput
-from spyglass.utils import SpyglassMixin, logger
+from spyglass.utils import SpyglassMixin
 
-try:
-    from hexmaze import (
-        classify_maze_hexes,
-        divide_into_thirds,
-        get_choice_direction,
-        get_critical_choice_points,
-        get_hexes_from_port,
-        get_maze_attributes,
-        get_reward_path_lengths,
-        plot_hex_maze,
-    )
-except ImportError:
-    logger.error("Could not find one or more hexmaze functions.")
-    (
-        get_maze_attributes,
-        get_critical_choice_points,
-        divide_into_thirds,
-        classify_maze_hexes,
-        get_hexes_from_port,
-        get_choice_direction,
-        get_reward_path_lengths,
-        plot_hex_maze,
-    ) = (None,) * 8
+from hexmaze import (
+    classify_maze_hexes,
+    divide_into_thirds,
+    get_critical_choice_points,
+    get_edge_hex_centroids,
+    get_hexes_from_port,
+    get_maze_attributes,
+    get_port_choice_direction,
+    get_reward_path_lengths,
+    plot_hex_maze,
+)
 
 schema = dj.schema("hex_maze")
 
@@ -409,7 +397,7 @@ class HexMazeChoice(SpyglassMixin, dj.Computed):
             return
 
         # Compute choice features
-        choice_direction = get_choice_direction(
+        choice_direction = get_port_choice_direction(
             trial_row["start_port"], trial_row["end_port"]
         )
         chosen_prob, unchosen_prob = self.get_reward_probs(trial_row)
@@ -722,55 +710,23 @@ class HexCentroids(dj.Imported):
         """
         Given a dict of hex centroids, calculate the centroids of the 6 side half-hexes
         near the reward ports (i.e. the sides to the left/right of hexes 4, 49, and 48)
+
+        Parameters:
+            hex_centroids (dict): Dictionary of hex_id (int, 1-49) to (x, y) centroid.
+
+        Returns:
+            dict[str, tuple]: (x, y) centroid for each of the 6 side half-hexes, keyed
+                "4_left", "4_right", "49_left", "49_right", "48_left", and "48_right".
+                "left" and "right" are from the perspective of a rat approaching that 
+                reward port from the center of the maze
         """
-
-        def find_4th_hex_centroid_parallelogram(top_hex, middle_hex, bottom_hex):
-            """
-            Helper function used for finding centroids of the side half-hexes by reward ports.
-
-            Given 3 (x,y) hex centroids top_hex, middle_hex, and bottom_hex, find the
-            4th hex centroid such that the 4 hexes are arranged in a parallelogram.
-
-            For example, to find the centroid of the side hex to the left of hex 4
-            (when facing the reward port), top_hex=1, middle_hex=4, bottom_hex=6.
-
-            Note that 'top' and 'bottom' are relative and interchangeable - generally, I set
-            the 'top' hex as one of the reward ports. (it doesn't have to be 'top' and 'bottom'
-            in an x,y coordinate sense, but 'middle' needs to be the hex between them)
-            """
-            other_middle_hex = np.array(top_hex) + (
-                np.array(bottom_hex) - np.array(middle_hex)
-            )
-            return tuple(other_middle_hex)
-
-        # Calculate the centroids of the 6 side half-hexes next to the reward ports
-        hex4left = find_4th_hex_centroid_parallelogram(
-            hex_centroids[1], hex_centroids[4], hex_centroids[6]
-        )
-        hex4right = find_4th_hex_centroid_parallelogram(
-            hex_centroids[1], hex_centroids[4], hex_centroids[5]
-        )
-        hex49left = find_4th_hex_centroid_parallelogram(
-            hex_centroids[2], hex_centroids[49], hex_centroids[47]
-        )
-        hex49right = find_4th_hex_centroid_parallelogram(
-            hex_centroids[2], hex_centroids[49], hex_centroids[38]
-        )
-        hex48left = find_4th_hex_centroid_parallelogram(
-            hex_centroids[3], hex_centroids[48], hex_centroids[33]
-        )
-        hex48right = find_4th_hex_centroid_parallelogram(
-            hex_centroids[3], hex_centroids[48], hex_centroids[43]
-        )
-        # Return a dict of side hex centroids
-        return {
-            "4_left": hex4left,
-            "4_right": hex4right,
-            "49_left": hex49left,
-            "49_right": hex49right,
-            "48_left": hex48left,
-            "48_right": hex48right,
-        }
+        # The 6 open half-hexes next to the reward ports (the sides to the left/right of hexes 4, 49, and 48)
+        open_side_hexes = ("4_left", "4_right", "49_left", "49_right", "48_left", "48_right")
+            
+        # get_edge_hex_centroids returns the centroids of all 18 half-hexes (including the side barriers),
+        # but we only keep the open side hexes adjacent to reward ports
+        all_half_hexes = get_edge_hex_centroids(hex_centroids)
+        return {side_hex: all_half_hexes[side_hex] for side_hex in open_side_hexes}
 
     def make(self, key):
         # Skip if already populated
@@ -1083,10 +1039,8 @@ class HexPosition(SpyglassMixin, dj.Computed):
         or
             (HexPosition & key).fetch_hex_and_position_dataframe()
 
-        Returns
-        -------
-        pd.DataFrame
-            Combined position + hex dataframe filtered to valid block times.
+        Returns:
+            df: Combined position + hex dataframe filtered to valid block times.
         """
 
         # Allow usage with restricted table or explicit key

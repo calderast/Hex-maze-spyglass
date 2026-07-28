@@ -14,51 +14,39 @@ import spyglass.common as sgc
 from spyglass.common import TaskEpoch, IntervalList, AnalysisNwbfile
 from spyglass.common.custom_nwbfile import AnalysisNwbfile as custom_AnalysisNwbfile
 from spyglass.decoding.decoding_merge import DecodingOutput
-from spyglass.lfp.analysis.v1.lfp_band import LFPBandV1, LFPBandSelection
-from spyglass.utils import SpyglassMixin, logger
+from spyglass.utils import SpyglassMixin
 
 from spyglass_hexmaze.hex_maze_behavior import HexCentroids, HexMazeBlock
 
-try:
-    from hexmaze import (
-        are_points_in_maze,
-        classify_maze_hexes,
-        divide_into_thirds,
-        get_all_choice_points,
-        get_critical_choice_points,
-        get_junction_left_right_map,
-        get_hexes_before_divergence,
-        get_hexes_from_port,
-        get_optimal_path_hexes_after_divergence,
-        get_path_divergence_point,
-        get_unreachable_hexes,
-        maze_to_barrier_set,
-        maze_to_graph,
-        get_hex_distance,
-        plot_hex_maze,
-    )
-except ImportError:
-    logger.error("required hexmaze functions could not be imported")
-    (
-        are_points_in_maze,
-        classify_maze_hexes,
-        divide_into_thirds,
-        get_all_choice_points,
-        get_critical_choice_points,
-        get_junction_left_right_map,
-        get_hexes_before_divergence,
-        get_hexes_from_port,
-        get_optimal_path_hexes_after_divergence,
-        get_path_divergence_point,
-        get_unreachable_hexes,
-        maze_to_barrier_set,
-        maze_to_graph,
-        get_hex_distance,
-        plot_hex_maze,
-    ) = (None,) * 15
+from hexmaze import (
+    are_points_in_maze,
+    classify_maze_hexes,
+    divide_into_thirds,
+    get_all_choice_points,
+    get_critical_choice_points,
+    get_junction_left_right_map,
+    get_hexes_before_divergence,
+    get_hexes_from_port,
+    get_optimal_path_hexes_after_divergence,
+    get_path_divergence_point,
+    get_unreachable_hexes,
+    maze_to_barrier_set,
+    maze_to_graph,
+    get_hex_distance,
+    plot_hex_maze,
+)
 
 
 schema = dj.schema("hex_maze_decoding")
+
+# The theta tables moved to hex_maze_theta.py (they are LFP signal processing, not decoding)
+# Re-exported here so existing
+#     from spyglass_hexmaze.hex_maze_decoding import HexMazeThetaV1
+# imports keep working.
+from spyglass_hexmaze.hex_maze_theta import (  # noqa: E402,F401
+    HexMazeThetaV1,
+    HexMazeThetaReference,
+)
 
 
 def _decode_interval_epoch(nwb_file_name, decoding_interval, run_intervals):
@@ -256,29 +244,23 @@ def compute_aheadness(
 
     This is the raw quantity whose *sign* HexMazeDecodedPosition bakes into
     `decode_distance` (decode_distance = sign(aheadness) * graph distance).
-    Returning the raw cosine lets you recompute the ahead/behind sign later with
-    any threshold or deadband you like, without touching the distance magnitude.
+    Returning the raw cosine lets us recompute the ahead/behind sign later with
+    any threshold or deadband we want, without touching the distance magnitude.
 
     Note: this uses the straight-line (Euclidean) direction to the decode, so it
-    needs only the columns already stored in HexMazeDecodedPosition — no track
-    graph. It is therefore cheap (vectorized) but topology-blind: near a corner or
-    junction the straight line can cut through a wall, so the sign can disagree
-    with the graph-based one there. Along a straight arm the two agree.
+    needs only the columns already stored in HexMazeDecodedPosition (no track
+    graph). It is topology-blind (near a corner or junction the straight line 
+    can cut through a barrier).
 
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Typically HexMazeDecodedPosition.fetch1_dataframe(). Must contain the
-        orientation, actual-position, and decoded-position columns below.
-    orientation_col : str
-        Column holding the rat's head direction, in radians.
-    position_cols, decode_cols : tuple[str, str]
-        (x, y) column names for the rat's actual position and the decoded position.
+    Parameters:
+        df (pd.DataFrame): Typically HexMazeDecodedPosition.fetch1_dataframe(). Must
+            contain the orientation, actual-position, and decoded-position columns below.
+        orientation_col (str): Column holding the rat's head direction, in radians
+        position_cols (tuple[str, str]): (x, y) column names for the rat's actual position
+        decode_cols (tuple[str, str]): (x, y) column names for the decoded position
 
-    Returns
-    -------
-    pd.Series
-        cos(Δθ) per time point, aligned to df's index.
+    Returns:
+        pd.Series: cos(Δθ) per time point, aligned to df's index
     """
     # Straight-line direction (radians) from the rat to the decoded position
     direction_to_decode = np.arctan2(
@@ -296,12 +278,8 @@ def get_open_hexes(maze):
 
 def get_epoch_blocks_in_order(nwb_file_name, epoch):
     """
-    Every block in this epoch, in chronological order, with its time bounds and open hexes.
-
-    Block numbers count up within an epoch, so sorting by block number gives us chronological
-    order. This is what lets us ask "was this hex open earlier in the epoch, and how many
-    blocks ago?" while looking only at the past - a hex that is a barrier now and only opens
-    up in some later block should not count as having been open.
+    Every block in this epoch in order with its time bounds and open hexes.
+    Helpful so we can get hexes open in this block or previous blocks for assigning decode to hex.
 
     Note that "open" excludes unreachable hexes as well as barriers (see get_open_hexes), so
     a hex walled off into an unreachable island counts as blocked for as long as it is
@@ -340,10 +318,14 @@ def get_epoch_blocks_in_order(nwb_file_name, epoch):
 
 def blocks_ago_label(blocks_ago):
     """
-    Human-readable label for how recently a hex was open, given the number of blocks since
-    it was last open (0 = open right now, None = it has not been open yet this epoch).
+    Human-readable label for how recently a hex was open.
 
-    Returns one of "open", "open_1_block_ago", "open_2_blocks_ago", ..., or "never_open".
+    Parameters:
+        blocks_ago (int or None): How many blocks back the hex was last open
+            (0 = open right now, None = it has not been open yet this epoch)
+
+    Returns:
+        str: "open", "open_1_block_ago", "open_2_blocks_ago", ..., or "never_open"
     """
     if blocks_ago is None:
         return "never_open"
@@ -353,77 +335,80 @@ def blocks_ago_label(blocks_ago):
     return f"open_{blocks_ago}_block_ago" if blocks_ago == 1 else f"open_{blocks_ago}_blocks_ago"
 
 
-def assign_position_to_hex(positions_xy, hex_centroids, maze=None, allowed_hexes=None):
+def core_hex(hex_id):
     """
-    Assign each (x, y) position to the nearest hex.
+    The core hex (1-49) behind a hex id: "17" -> 17, and "4_left" or "4_right" -> 4.
 
-    By default, only hexes the rat could actually occupy are considered. Which hexes those
-    are depends on what you pass:
-        - maze: use the hexes open in that maze config (barriers and unreachable hexes excluded)
-        - allowed_hexes: use exactly the hexes you specify (e.g. every hex open at any point
-          in the epoch so far, built up from get_epoch_blocks_in_order)
-        - neither: use every hex in hex_centroids, i.e. assign to the nearest hex regardless
-          of whether it was ever open
+    The 6 side half-hexes next to the reward ports are keyed by the hex they hang off plus
+    a side, so this is how we fold them back into a real hex.
 
     Parameters:
-        positions_xy: np.ndarray, shape (n_positions, 2)
-        hex_centroids: dict mapping hex_id to (x, y) centroid (including side hexes)
-        maze: hex maze config (to exclude hexes that are barriers or unreachable)
-        allowed_hexes: iterable of hex ids (1-49) to restrict assignment to.
-            Takes precedence over maze if both are given.
+        hex_id (str or int): a hex id as keyed in a hex_centroids dict, e.g. "17" or "4_left"
 
     Returns:
-        core_hex (list[int]): Closest core hex (1-49) for each hex for each xy position
-        hex_including_sides (list[str]): Closest hex (including side hexes) for each xy position
-        distance_from_centroid (np.ndarray): Distance between each xy position and centroid of assigned hex
+        int: the core hex (1-49)
     """
+    return int(re.match(r"\d+", str(hex_id)).group())
 
-    # Figure out which hexes we're allowed to assign positions to.
-    # hex_centroids keys are strings ("4", "4_left"), so compare as strings.
-    # Note that the side half-hexes ("4_left") are always kept - their core hexes 4, 49, and
-    # 48 sit next to the reward ports and can never be barriers.
-    if allowed_hexes is not None:
-        keep_hexes = {str(h) for h in allowed_hexes}
-        centroids_to_use = {
-            hex: coords for hex, coords in hex_centroids.items()
-            if re.match(r"\d+", hex).group() in keep_hexes
-        }
-    elif maze is not None:
-        # Exclude hexes that are barriers or unreachable so we don't assign position to them
-        exclude_hexes = {str(h) for h in maze_to_barrier_set(maze) | get_unreachable_hexes(maze)}
-        centroids_to_use = {hex: coords for hex, coords in hex_centroids.items() if hex not in exclude_hexes}
-    else:
-        # No restriction: assign to the nearest hex out of all of them
-        centroids_to_use = dict(hex_centroids)
 
-    # Convert centroids to array for fast computation
-    hex_ids = list(centroids_to_use.keys())
-    hex_coords = np.array(list(centroids_to_use.values())) # shape (n_hexes, 2)
+def centroids_for_hexes(hex_centroids, allowed_hexes):
+    """
+    Narrow a hex_centroids dict to just the given hexes, so assign_position_to_hex can only
+    assign to those - most often the hexes open in this block's maze, via get_open_hexes(maze),
+    so that a position never lands on a hex the rat could not have been in. 
+    
+    A side half-hex is kept whenever its core hex is: e.g. "4_left" kept when 4 in allowed_hexes.
 
-    # Compute distances from each x, y position to each hex centroid, then take the closest.
-    # We do this in chunks of positions because the intermediate distance array has shape
-    # (n_positions, n_hexes, 2) - assigning a whole session at once would otherwise need
-    # hundreds of MB of memory. Chunking gives identical results using a fixed amount.
+    Parameters:
+        hex_centroids (dict): hex id to (x, y) centroid, including the side half-hexes
+        allowed_hexes (iterable of int): core hex ids (1-49) to keep
+
+    Returns:
+        dict: the subset of hex_centroids belonging to allowed_hexes, in the same order
+    """
+    allowed = set(allowed_hexes)
+    return {h: xy for h, xy in hex_centroids.items() if core_hex(h) in allowed}
+
+
+def assign_position_to_hex(positions_xy, hex_centroids):
+    """
+    Assign each (x, y) position to the nearest hex centroid.
+    
+    Also return the distance from a point to its assigned centroid. 
+    This is useful for downstream filtering: if a point is more than a hex radius from 
+    its assigned centroid, it is probably not actually in that hex. (This happens e.g. 
+    when the rat's head is out of the maze, or if a decoded position is in a barrier
+    hex that is not included in the centroids list).
+
+    Parameters:
+        positions_xy (np.ndarray): shape (n_positions, 2), the (x, y) positions to assign
+        hex_centroids (dict): hex id to (x, y) centroid to assign to
+
+    Returns:
+        assigned_hex (list): id of the nearest centroid for each position, keyed as in
+            hex_centroids (e.g. "17" or "4_left")
+        distance_from_centroid (np.ndarray): distance from each position to that centroid
+    """
+    hex_ids = list(hex_centroids.keys())
+    hex_coords = np.array(list(hex_centroids.values()))  # shape (n_hexes, 2)
+
+    # Find the closest centroid for each position and how far away it is. 
+    # Work in chunks of positions: 'diffs' below is (n_positions, n_hexes, 2) floats, 
+    # so a whole session at once would need > 1 GB. Chunking caps it at ~44 MB 
     chunk_size = 50_000
     closest_idx = np.empty(len(positions_xy), dtype=int)
     distance_from_centroid = np.empty(len(positions_xy))
     for start in range(0, len(positions_xy), chunk_size):
         chunk = positions_xy[start : start + chunk_size]
-        diffs = chunk[:, np.newaxis, :] - hex_coords[np.newaxis, :, :] # shape (n_chunk, n_hexes, 2)
-        dists = np.linalg.norm(diffs, axis=2) # shape (n_chunk, n_hexes)
-        # Find the closest hex centroid, and its distance, for each x, y position
-        closest_idx[start : start + len(chunk)] = np.argmin(dists, axis=1)
-        distance_from_centroid[start : start + len(chunk)] = np.min(dists, axis=1)
+        stop = start + len(chunk)
+        # Distance from every position in the chunk to every centroid, (n_chunk, n_hexes)
+        diffs = chunk[:, np.newaxis, :] - hex_coords[np.newaxis, :, :]
+        distances = np.linalg.norm(diffs, axis=2)
+        closest_idx[start:stop] = np.argmin(distances, axis=1)
+        distance_from_centroid[start:stop] = np.min(distances, axis=1)
 
-    closest_hex_including_sides = [hex_ids[i] for i in closest_idx]
-
-
-    # Closest_hex_including_sides includes ids for the 6 side hexes next to the reward ports (e.g '4_left')
-    # Closest_core_hex assigns the side hexes to their "core" hex (e.g. '4_left' and '4_right') become 4
-    closest_core_hex = [int(re.match(r"\d+", h).group()) for h in closest_hex_including_sides]
-
-    # Return lists (same length as position_xy) of the closest hex for each position
-    return closest_core_hex, closest_hex_including_sides, distance_from_centroid
+    # Return a list (same length as positions_xy) of the closest hex for each position
+    return [hex_ids[i] for i in closest_idx], distance_from_centroid
 
 
 @schema
@@ -485,17 +470,23 @@ class HexMazeDecodedPositionHex(SpyglassMixin, dj.Computed):
 
             # Filter position_df to only include times for this block
             block_pos = position_df.loc[block_start:block_end]
-            
+
+            # Only assign positions to hexes that are open in this block's maze, so a
+            # position never lands on a hex the rat could not have been in
+            open_centroids = centroids_for_hexes(hex_centroids, get_open_hexes(maze))
+
             # Assign actual position to hex
             actual_xy = block_pos[["position_x", "position_y"]].to_numpy()
-            actual_core_hex, hex_incl_sides, dist_from_centroid = assign_position_to_hex(actual_xy, hex_centroids, maze)
+            hex_incl_sides, dist_from_centroid = assign_position_to_hex(actual_xy, open_centroids)
+            actual_core_hex = [core_hex(h) for h in hex_incl_sides]
             hex_df.loc[block_pos.index, "hex"] = actual_core_hex
             hex_df.loc[block_pos.index, "hex_including_sides"] = hex_incl_sides
             hex_df.loc[block_pos.index, "distance_from_centroid"] = dist_from_centroid
 
             # Assign decoded position to hex
             decode_xy = block_pos[["decode_position_x", "decode_position_y"]].to_numpy()
-            decode_core_hex, hex_incl_sides, dist_from_centroid = assign_position_to_hex(decode_xy, hex_centroids, maze)
+            hex_incl_sides, dist_from_centroid = assign_position_to_hex(decode_xy, open_centroids)
+            decode_core_hex = [core_hex(h) for h in hex_incl_sides]
             hex_df.loc[block_pos.index, "decode_hex"] = decode_core_hex
             hex_df.loc[block_pos.index, "decode_hex_including_sides"] = hex_incl_sides
             hex_df.loc[block_pos.index, "decode_distance_from_centroid"] = dist_from_centroid
@@ -547,12 +538,11 @@ class HexMazeDecodedPositionHexV2(SpyglassMixin, dj.Computed):
     """
     Extension of HexMazeDecodedPositionHex with alternative hex assignments.
 
-    HexMazeDecodedPositionHex assigns each position to the nearest hex that is open in the
+    HexMazeDecodedPositionHex assigns each decoded position to the nearest hex that is open in the
     current block, which means a decode that lands on a barrier hex gets snapped to whatever
-    open hex happens to be closest. That is the right thing to do most of the time, but it
-    hides the cases we sometimes care about: decodes of locations that used to be open
-    (barrier change sessions), decodes of locations that were never open, and decodes that
-    fell off the maze entirely.
+    open hex happens to be closest. This hides the cases we sometimes care about: decodes of hexes 
+    that were open in previous blocks (or even decodes of hexes that were never open in this epoch 
+    but the rat might be thinking about anyway based on previous knowledge of the maze).
 
     History here is scoped to the epoch, and looks only at the past: "open at some point"
     always means open in the current block or an earlier block of the same epoch, never a
@@ -567,7 +557,6 @@ class HexMazeDecodedPositionHexV2(SpyglassMixin, dj.Computed):
         decode_epoch_open_distance_from_centroid
 
     Assignment allowing all hexes, regardless of whether they were ever open:
-        hex_any, hex_any_including_sides, any_distance_from_centroid
         decode_hex_any, decode_hex_any_including_sides, decode_any_distance_from_centroid
 
     Whether the position falls inside the maze's physical footprint (1 = yes, 0 = no):
@@ -578,14 +567,14 @@ class HexMazeDecodedPositionHexV2(SpyglassMixin, dj.Computed):
         decode_hex_blocks_since_open: 0 if the hex is open in the current block, N if the
             most recent block it was open in was N blocks ago, -1 if it has not been open
             yet this epoch, and -100 for timepoints outside any block.
-        decode_hex_open_status: the same thing as a label - "open", "open_1_block_ago",
+        decode_hex_open_status: the same thing as a label: "open", "open_1_block_ago",
             "open_2_blocks_ago", ..., "never_open", or "None" outside any block.
 
-    Note that hex_any, decode_hex_any, in_maze, and decode_in_maze do not depend on the maze
+    Note that decode_hex_any, in_maze, and decode_in_maze do not depend on the maze
     config, so they are filled for every timepoint in the decode. The epoch-open and
     open-status columns do depend on which block we are in, so (like the parent table's
-    columns) they are only filled during blocks. In practice a decode basically always falls
-    inside a block, so the outside-block defaults are just a safety net.
+    columns) they are only filled during blocks. (We should always be within block time 
+    bounds, so the outside-block defaults are just a safety net).
     """
 
     definition = """
@@ -614,31 +603,22 @@ class HexMazeDecodedPositionHexV2(SpyglassMixin, dj.Computed):
         actual_xy = combined_df[["position_x", "position_y"]].to_numpy()
         decode_xy = combined_df[["decode_position_x", "decode_position_y"]].to_numpy()
 
-        # Assign actual and decoded position to the nearest hex out of all hexes, whether or
-        # not that hex was ever open (no maze/allowed_hexes restriction). This doesn't depend
-        # on the maze config, so unlike the parent table we can do it in one pass over the
-        # whole session instead of block by block.
-        any_hex, any_incl_sides, any_dist = assign_position_to_hex(actual_xy, hex_centroids)
-        combined_df["hex_any"] = any_hex
-        combined_df["hex_any_including_sides"] = any_incl_sides
-        combined_df["any_distance_from_centroid"] = any_dist
-
-        decode_any_hex, decode_any_incl_sides, decode_any_dist = assign_position_to_hex(
-            decode_xy, hex_centroids
-        )
-        combined_df["decode_hex_any"] = decode_any_hex
+        # Assign decoded position to the nearest hex out of all hexes, whether or
+        # not that hex was ever open (we pass the full centroid dict). This
+        # doesn't depend on the maze config, so unlike the parent table we can do it in one
+        # pass over the whole session instead of block by block.
+        decode_any_incl_sides, decode_any_dist = assign_position_to_hex(decode_xy, hex_centroids)
+        combined_df["decode_hex_any"] = [core_hex(h) for h in decode_any_incl_sides]
         combined_df["decode_hex_any_including_sides"] = decode_any_incl_sides
         combined_df["decode_any_distance_from_centroid"] = decode_any_dist
 
-        # Flag positions that fall outside the physical footprint of the maze
-        # (stored as 1/0 instead of True/False to keep the NWB dtype simple)
+        # Flag positions that fall outside the physical footprint of the maze (with tolerance 1/20 of hex)
         combined_df["in_maze"] = are_points_in_maze(actual_xy, core_hex_centroids).astype(int)
         combined_df["decode_in_maze"] = are_points_in_maze(decode_xy, core_hex_centroids).astype(int)
 
         # The remaining columns depend on which blocks of this epoch have already happened,
-        # so we walk the epoch's blocks in chronological order. A decode basically always
-        # falls inside a block, but any timepoint that doesn't keeps these defaults
-        # (-100 and "None", as elsewhere, to avoid nan/HDF5 datatype issues).
+        # so we walk the epoch's blocks in chronological order
+        # (Use -100 and "None", as defaults to avoid nan/HDF5 datatype issues)
         combined_df["decode_hex_epoch_open"] = -100
         combined_df["decode_hex_epoch_open_including_sides"] = "None"
         combined_df["decode_epoch_open_distance_from_centroid"] = -100.0
@@ -649,9 +629,9 @@ class HexMazeDecodedPositionHexV2(SpyglassMixin, dj.Computed):
         # each epoch starts over with nothing having been open yet.
         epoch_blocks = get_epoch_blocks_in_order(key["nwb_file_name"], key["epoch"])
 
-        # As we walk forward through blocks, remember the most recent block each hex was open
-        # in. Because we only ever look at what we have already walked past, no information
-        # from future blocks can leak in.
+        # As we walk forward through blocks, remember the most recent block each hex was open in
+        # We only add hexes to this set once they are reachable in a block 
+        # (so it exludes hexes that were never open in this epoch by default)
         last_open_block_idx = {}  # hex -> index of the most recent block it was open in
 
         for block_idx, block in enumerate(epoch_blocks):
@@ -659,7 +639,7 @@ class HexMazeDecodedPositionHexV2(SpyglassMixin, dj.Computed):
             for open_hex in block["open_hexes"]:
                 last_open_block_idx[open_hex] = block_idx
 
-            # Filter to only include times for this block
+            # Filter dataframe to only include times for this block
             block_pos = combined_df.loc[block["start_time"]:block["end_time"]]
             if block_pos.empty:
                 continue
@@ -672,15 +652,16 @@ class HexMazeDecodedPositionHexV2(SpyglassMixin, dj.Computed):
 
             # Assign decoded position to the nearest hex that has been open at some point so far
             decode_xy_block = block_pos[["decode_position_x", "decode_position_y"]].to_numpy()
-            epoch_hex, epoch_incl_sides, epoch_dist = assign_position_to_hex(
-                decode_xy_block, hex_centroids, allowed_hexes=open_so_far
+            epoch_open_centroids = centroids_for_hexes(hex_centroids, open_so_far)
+            epoch_incl_sides, epoch_dist = assign_position_to_hex(
+                decode_xy_block, epoch_open_centroids
             )
-            combined_df.loc[block_pos.index, "decode_hex_epoch_open"] = epoch_hex
+            combined_df.loc[block_pos.index, "decode_hex_epoch_open"] = [core_hex(h) for h in epoch_incl_sides]
             combined_df.loc[block_pos.index, "decode_hex_epoch_open_including_sides"] = epoch_incl_sides
             combined_df.loc[block_pos.index, "decode_epoch_open_distance_from_centroid"] = epoch_dist
 
-            # Record how recently the decode's true nearest hex was last open, as a number of
-            # blocks (-1 if it has not been open yet this epoch) and as a readable label
+            # Record how recently decode_hex_any (the true nearest hex) was last open, 
+            # as a number of  blocks (-1 if it has not been open yet this epoch) and as a readable label
             combined_df.loc[block_pos.index, "decode_hex_blocks_since_open"] = [
                 blocks_since_open.get(h, -1) for h in block_pos["decode_hex_any"]
             ]
@@ -688,18 +669,26 @@ class HexMazeDecodedPositionHexV2(SpyglassMixin, dj.Computed):
                 blocks_ago_label(blocks_since_open.get(h)) for h in block_pos["decode_hex_any"]
             ]
 
-        # Rearrange columns: actual position/hex first, then decoded position/hex
+        # Rearrange columns
+        # Actual position (same as hexMazeDecodedPositionHex) - only assigned to currently open hexes
         actual_cols = ["position_x", "position_y", "orientation", "velocity_x", "velocity_y", "speed",
-                       "hex", "hex_including_sides", "distance_from_centroid",
-                       "hex_any", "hex_any_including_sides", "any_distance_from_centroid", "in_maze"]
+                       "hex", "hex_including_sides", "distance_from_centroid", "in_maze"]
+        # Decoded position - assigned in a variety of ways 
         decode_cols = ["decode_position_x", "decode_position_y",
+                       # hexes currently open (same as hexMazeDecodedPositionHex)
                        "decode_hex", "decode_hex_including_sides", "decode_distance_from_centroid",
+                       # hexes open at any point in this epoch (up until this point)
                        "decode_hex_epoch_open", "decode_hex_epoch_open_including_sides",
                        "decode_epoch_open_distance_from_centroid",
+                       # any hex 1-49 even if never open/not open yet in this epoch
                        "decode_hex_any", "decode_hex_any_including_sides",
                        "decode_any_distance_from_centroid",
-                       "decode_hex_blocks_since_open", "decode_hex_open_status", "decode_in_maze",
-                       "decode_distance", "decode_hex_distance", "hpd_thresh", "spatial_cov"]
+                       # for decode assigned to any hex, note if that hex is currently open/when it was last open
+                       "decode_hex_blocks_since_open", "decode_hex_open_status", 
+                       # distance measures (same as hexMazeDecodedPositionHex) + is decode in maze
+                       "decode_in_maze", "decode_distance", "decode_hex_distance", 
+                       # decode quality metrics
+                       "hpd_thresh", "spatial_cov"]
         combined_df = combined_df[[c for c in actual_cols + decode_cols if c in combined_df.columns]]
 
         # Save time as a column instead of index (NWB requires integer index)
@@ -719,7 +708,6 @@ class HexMazeDecodedPositionHexV2(SpyglassMixin, dj.Computed):
     # most analyses don't need, so fetch1_dataframe drops them (same as the parent table)
     _drop_cols = [
         "hex_including_sides", "distance_from_centroid",
-        "hex_any_including_sides", "any_distance_from_centroid",
         "decode_hex_including_sides", "decode_distance_from_centroid",
         "decode_hex_epoch_open_including_sides", "decode_epoch_open_distance_from_centroid",
         "decode_hex_any_including_sides", "decode_any_distance_from_centroid",
@@ -1085,6 +1073,9 @@ class HexMazeDecodedHexPath(SpyglassMixin, dj.Computed):
         return axes
 
 
+
+#### These are in dev and Steph might mess with them at any time, fyi
+
 @schema
 class HexMazeDecodedPositionHexAnnotated(SpyglassMixin, dj.Computed):
     """
@@ -1285,190 +1276,6 @@ class HexMazeDecodedPositionHexAnnotated(SpyglassMixin, dj.Computed):
 
     def fetch1_dataframe(self):
         return self.fetch_nwb()[0]["annotated_hex"].set_index("time")
-
-
-@schema
-class HexMazeDecodedPositionAll(SpyglassMixin, dj.Computed):
-    """
-    Calculates most likely decoded position at each time point.
-    Assigns actual and decoded position at each time point to the nearest maze hex.
-    Stores combined dataframe of decoded and actual position, including assigned hex,
-    decode confidence metrics (hpd threshold, spatial coverage of 95% confidence region),
-    and distance between decoded and actual position.
-    """
-
-    definition = """
-    -> DecodingOutput.proj(decoding_merge_id = "merge_id")
-    -> TaskEpoch
-    -> HexCentroids
-    ---
-    -> custom_AnalysisNwbfile
-    decoded_position_all_object_id: varchar(128)
-    """
-
-    @property
-    def key_source(self):
-        # Same cross-product issue as HexMazeDecodedPosition (DecodingOutput and TaskEpoch
-        # share no attribute), plus HexCentroids -- which joins cleanly on nwb_file_name and
-        # so naturally limits us to sessions that have centroids. Reuse the real
-        # (decode, epoch) pairs to restrict the cross product.
-        cross = DecodingOutput.proj(decoding_merge_id="merge_id") * TaskEpoch * HexCentroids
-        # .proj() drops the joined secondary columns so key_source is just the primary key
-        return (cross & valid_decoded_position_keys()).proj()
-
-    def make(self, key):
-        # Skip if already populated
-        if self & key:
-            return
-        decode_key = {"merge_id": key["decoding_merge_id"]}
-
-        # Get decode results
-        results = DecodingOutput.fetch_results(decode_key)
-
-        # Get the posterior (probability of decode at each x,y location at each time point)
-        # posterior has shape (n_time, n_x_bins, n_y_bins)
-        posterior = results.acausal_posterior.squeeze().unstack("state_bins").sum("state")
-
-        # Get timestamps
-        # timestamps have shape (n_time,)
-        timestamps = posterior.time.values
-
-        # Get the max likelihood x,y coordinate at each time point
-        # max_likelihood_position has shape (n_time, 2)
-        max_likelihood_position = analysis.maximum_a_posteriori_estimate(posterior)
-
-        # Get the threshold to plug into get_HPD_spatial_coverage
-        # hpd_thresh has shape (n_time,)
-        hpd_thresh = get_highest_posterior_threshold(posterior, coverage=0.95).squeeze()
-
-        # posterior_stacked has shape (n_time, n_x_bins times n_y_bins)
-        posterior_stacked = posterior.stack(position=["x_position", "y_position"])
-        posterior_stacked = posterior_stacked.assign_coords(position=np.arange(posterior_stacked.position.size))
-
-        # spatial_cov has shape (n_time,)
-        spatial_cov = get_HPD_spatial_coverage(posterior_stacked, hpd_thresh)
-
-        # Make dataframe of decoded position info
-        decoded_position_df = pd.DataFrame(
-            {
-                "time": timestamps,
-                "hpd_thresh": hpd_thresh,
-                "spatial_cov": spatial_cov,
-                "decode_position_x": max_likelihood_position[:, 0],
-                "decode_position_y": max_likelihood_position[:, 1],
-            }
-        ).set_index("time")
-
-        # Get source table (either ClusterlessDecodingV1 or SortedSpikesDecodingV1)
-        source_table = DecodingOutput().merge_restrict_class(decode_key)
-        classifier = source_table.fetch_model()
-
-        # Get actual position and orientation data from source table
-        position_df, position_variable_names = source_table.fetch_position_info(source_table.fetch1("KEY"))
-        orientation_name = source_table.get_orientation_col(position_df)
-
-        # Enforce that position columns are 'position_x', 'position_y' for consistency (just in case)
-        position_df = position_df.rename(columns={
-            position_variable_names[0]: "position_x",
-            position_variable_names[1]: "position_y",
-        })
-
-        # Create combined df of actual and decode position
-        combined_df = pd.merge(position_df, decoded_position_df, left_index=True, right_index=True)
-
-        # Add distance between actual and decode position to the df
-        combined_df["decode_distance"] = analysis.get_ahead_behind_distance2D(
-            combined_df[["position_x", "position_y"]].to_numpy(),
-            combined_df[orientation_name].to_numpy(),
-            combined_df[["decode_position_x", "decode_position_y"]].to_numpy(),
-            classifier.environments[0].track_graph,
-            classifier.environments[0].edges_,
-        )
-
-        ## Hex assignment
-        # Get a dict of hex: (x, y) centroid in cm for this nwbfile
-        hex_centroids = HexCentroids.get_hex_centroids_dict_cm(key)
-
-        # Set up hex columns (use -100 and "None" instead of nan to avoid HDF5 datatype issues)
-        for col in ["hex", "decode_hex"]:
-            combined_df[col] = -100
-        for col in ["hex_including_sides", "decode_hex_including_sides"]:
-            combined_df[col] = "None"
-        for col in ["distance_from_centroid", "decode_distance_from_centroid"]:
-            combined_df[col] = -100.0
-        combined_df["decode_hex_distance"] = -100
-
-        # Loop through all blocks in this epoch
-        for block in HexMazeBlock & {
-            "nwb_file_name": key["nwb_file_name"],
-            "epoch": key["epoch"],
-        }:
-            # Get maze config for this block
-            maze = block.get("config_id")
-
-            # Get the block start and end times
-            block_start, block_end = (
-                sgc.IntervalList
-                & {
-                    "nwb_file_name": key["nwb_file_name"],
-                    "interval_list_name": block["interval_list_name"],
-                }
-            ).fetch1("valid_times")[0]
-
-            # Filter to only include times for this block
-            block_pos = combined_df.loc[block_start:block_end]
-
-            # Assign actual position to hex
-            actual_xy = block_pos[["position_x", "position_y"]].to_numpy()
-            actual_core_hex, incl_sides, dist = assign_position_to_hex(actual_xy, hex_centroids, maze)
-            combined_df.loc[block_pos.index, "hex"] = actual_core_hex
-            combined_df.loc[block_pos.index, "hex_including_sides"] = incl_sides
-            combined_df.loc[block_pos.index, "distance_from_centroid"] = dist
-
-            # Assign decoded position to hex
-            decode_xy = block_pos[["decode_position_x", "decode_position_y"]].to_numpy()
-            decode_core_hex, incl_sides, dist = assign_position_to_hex(decode_xy, hex_centroids, maze)
-            combined_df.loc[block_pos.index, "decode_hex"] = decode_core_hex
-            combined_df.loc[block_pos.index, "decode_hex_including_sides"] = incl_sides
-            combined_df.loc[block_pos.index, "decode_distance_from_centroid"] = dist
-
-            # Calculate hex distance between actual and decoded hex for each time point
-            combined_df.loc[block_pos.index, "decode_hex_distance"] = [
-                get_hex_distance(maze=maze, start_hex=a, target_hex=d)
-                for a, d in zip(actual_core_hex, decode_core_hex)
-            ]
-
-        # Rearrange columns: actual position/hex first, then decoded position/hex
-        actual_cols = ["position_x", "position_y", "orientation", "velocity_x", "velocity_y", "speed",
-                       "hex", "hex_including_sides", "distance_from_centroid"]
-        decode_cols = ["decode_position_x", "decode_position_y",
-                       "decode_hex", "decode_hex_including_sides", "decode_distance_from_centroid",
-                       "decode_distance", "decode_hex_distance", "hpd_thresh", "spatial_cov"]
-        combined_df = combined_df[[c for c in actual_cols + decode_cols if c in combined_df.columns]]
-
-        # Save time as a column instead of index (NWB requires integer index)
-        # reset_index() puts time as the first column automatically
-        combined_df = combined_df.reset_index()
-
-        # Create an AnalysisNwbfile with a link to the original nwb and add the df
-        with custom_AnalysisNwbfile().build(key["nwb_file_name"]) as builder:
-            key["decoded_position_all_object_id"] = builder.add_nwb_object(
-                combined_df, "decoded_position_all"
-            )
-            key["analysis_file_name"] = builder.analysis_file_name
-
-        self.insert1(key, skip_duplicates=True)
-
-    _drop_cols = [
-        "hex_including_sides", "distance_from_centroid",
-        "decode_hex_including_sides", "decode_distance_from_centroid",
-    ]
-
-    def fetch1_dataframe(self):
-        return self.fetch1_dataframe_full().drop(columns=self._drop_cols)
-
-    def fetch1_dataframe_full(self):
-        return self.fetch_nwb()[0]["decoded_position_all"].set_index("time")
 
 
 @schema
@@ -1848,485 +1655,3 @@ class HexMazeJunctionDecode(SpyglassMixin, dj.Computed):
 
     def fetch1_dataframe(self):
         return self.fetch_nwb()[0]["junction_decode"].set_index("time")
-
-
-@schema
-class HexMazeThetaV1(SpyglassMixin, dj.Computed):
-    """
-    Computes theta-band analytic signal, phase, and power from LFPBandV1.
-    Saves all three to a single analysis NWB file.
-
-    The analytic signal is stored as real + imaginary float columns because
-    HDF5/NWB can't store complex dtype directly. To reconstruct:
-        z = df['electrode 5_real'] + 1j * df['electrode 5_imag']
-
-    Phase is in radians, shifted to [0, 2π] (matching spyglass convention).
-    Power is amplitude squared (|analytic signal|²).
-
-    Dependencies (all must be populated before running make):
-        LFPElectrodeGroup  →  LFPSelection  →  LFPV1
-        LFPBandSelection  →  LFPBandV1
-
-    Use HexMazeThetaV1.setup_theta_pipeline() to create all those entries,
-    then call LFPBandV1().populate(lfp_band_key) before populating this table.
-
-    Typical usage:
-        # Step 1: set up the pipeline and populate broadband LFP (~2h locally)
-        lfp_band_key = HexMazeThetaV1.setup_theta_pipeline(
-            nwb_file_name="IM-1478_20220726_.nwb",
-            lfp_electrode_group_name="my_lfp_group",
-            electrode_ids=[0, 1, 2, ...],
-            interval_list_name="00_r1",
-        )
-        # Step 2: populate theta-band LFP
-        LFPBandV1().populate(lfp_band_key)
-        # Step 3: compute and store analytic signal, phase, power
-        HexMazeThetaV1().populate(lfp_band_key)
-    """
-
-    definition = """
-    -> LFPBandV1
-    ---
-    -> custom_AnalysisNwbfile
-    analytic_signal_object_id : varchar(128)   # real+imag parts of Hilbert transform
-    theta_phase_object_id     : varchar(128)   # instantaneous phase [0, 2π] in radians
-    theta_power_object_id     : varchar(128)   # instantaneous power (amplitude²)
-    """
-
-    def make(self, key):
-        # Skip if already populated
-        if self & key:
-            return
-        # Get the list of electrodes selected for this LFP band entry
-        electrode_ids = sorted(
-            (LFPBandSelection.LFPBandElectrode & key).fetch("electrode_id").tolist()
-        )
-
-        lfp_band_entry = LFPBandV1 & key
-
-        # Compute analytic signal (complex), instantaneous phase, and power.
-        # Each DataFrame has shape (n_timesteps × n_electrodes), time-indexed.
-        # Column names are "electrode {electrode_id}" for each electrode.
-        analytic_df = lfp_band_entry.compute_analytic_signal(electrode_list=electrode_ids)
-        phase_df = lfp_band_entry.compute_signal_phase(electrode_list=electrode_ids)
-        power_df = lfp_band_entry.compute_signal_power(electrode_list=electrode_ids)
-
-        # Split complex analytic signal into real and imaginary float columns
-        # so the DataFrame can be stored as HDF5 (NWB doesn't support complex dtype).
-        # Use .values.real/.values.imag — pandas DataFrame has no .real/.imag directly.
-        # Real columns: "electrode 5_real", imaginary: "electrode 5_imag"
-        analytic_stored = pd.concat(
-            [
-                pd.DataFrame(
-                    analytic_df.values.real,
-                    index=analytic_df.index,
-                    columns=[c + "_real" for c in analytic_df.columns],
-                ),
-                pd.DataFrame(
-                    analytic_df.values.imag,
-                    index=analytic_df.index,
-                    columns=[c + "_imag" for c in analytic_df.columns],
-                ),
-            ],
-            axis=1,
-        ).reset_index()  # move time index to column (NWB requires integer index)
-
-        phase_stored = phase_df.reset_index()
-        power_stored = power_df.reset_index()
-
-        # Save all three DataFrames to a single analysis NWB file
-        with custom_AnalysisNwbfile().build(key["nwb_file_name"]) as builder:
-            key["analytic_signal_object_id"] = builder.add_nwb_object(
-                analytic_stored, "analytic_signal"
-            )
-            key["theta_phase_object_id"] = builder.add_nwb_object(
-                phase_stored, "theta_phase"
-            )
-            key["theta_power_object_id"] = builder.add_nwb_object(
-                power_stored, "theta_power"
-            )
-            key["analysis_file_name"] = builder.analysis_file_name
-
-        self.insert1(key, skip_duplicates=True)
-
-    def fetch1_analytic_signal(self) -> pd.DataFrame:
-        """Return the analytic signal DataFrame, indexed by time.
-
-        Columns are 'electrode N_real' and 'electrode N_imag' for each electrode N.
-        To reconstruct complex signal: df['electrode 5_real'] + 1j * df['electrode 5_imag']
-        """
-        return self.fetch_nwb()[0]["analytic_signal"].set_index("time")
-
-    def fetch1_theta_phase(self) -> pd.DataFrame:
-        """Return instantaneous theta phase in radians [0, 2π], indexed by time.
-
-        Columns are 'electrode N' for each electrode N.
-        """
-        return self.fetch_nwb()[0]["theta_phase"].set_index("time")
-
-    def fetch1_theta_power(self) -> pd.DataFrame:
-        """Return instantaneous theta power (amplitude²), indexed by time.
-
-        Columns are 'electrode N' for each electrode N.
-        """
-        return self.fetch_nwb()[0]["theta_power"].set_index("time")
-
-    def average_analytic_signal(self, electrode_list) -> pd.Series:
-        """Average the complex analytic signal across a set of electrodes, indexed by time.
-
-        Averaging the complex signal (not the phases) is the correct way to combine
-        channels: in-phase theta adds, noise cancels. electrode_list entries can be
-        ints or strings ("57").
-        """
-        analytic = self.fetch1_analytic_signal()
-        z = sum(
-            analytic[f"electrode {int(e)}_real"] + 1j * analytic[f"electrode {int(e)}_imag"]
-            for e in electrode_list
-        ) / len(electrode_list)
-        z.name = "analytic_signal"
-        return z
-
-    def average_theta_phase(self, electrode_list) -> pd.Series:
-        """Averaged theta phase (radians [0, 2π]) across a set of electrodes, indexed by time."""
-        z = self.average_analytic_signal(electrode_list)
-        return pd.Series(np.mod(np.angle(z), 2 * np.pi), index=z.index, name="theta_phase")
-
-    def average_theta_power(self, electrode_list) -> pd.Series:
-        """Averaged theta power across a set of electrodes, indexed by time.
-
-        This is the mean of the per-channel power envelopes (average of powers), which is
-        robust to small phase differences between channels. For the *coherent* power of the
-        combined waveform instead (power of the average, which sags if channels drift out
-        of phase) use np.abs(self.average_analytic_signal(electrode_list)) ** 2.
-        """
-        power_df = self.fetch1_theta_power()
-        columns = [f"electrode {int(e)}" for e in electrode_list]
-        return power_df[columns].mean(axis=1).rename("theta_power")
-
-    def get_high_theta_intervals(
-        self,
-        threshold_percentile: float = 75.0,
-        electrode=None,
-        min_duration: float = 0.1,
-    ) -> np.ndarray:
-        """Return time intervals where theta power exceeds a percentile threshold.
-
-        Parameters
-        ----------
-        threshold_percentile : float
-            Percentile of the theta power distribution to use as the threshold.
-            Default 75 = top quartile of theta power.
-        electrode : str | list, optional
-            Which signal to threshold:
-            - a single electrode as 3, "3", or "electrode 3": that one electrode.
-            - a list/set of electrode ids (ints or "57" strings): average the per-channel
-              theta power across them — use this to threshold on a saved reference set
-              (e.g. stratum radiatum).
-            - None (default): average power across all electrodes.
-        min_duration : float
-            Minimum interval duration in seconds. Intervals shorter than this
-            are discarded. Default 0.1 s.
-
-        Returns
-        -------
-        np.ndarray, shape (N, 2)
-            Array of [start_time, end_time] rows in the Spyglass valid_times format.
-            Returns an empty (0, 2) array if no intervals pass the threshold.
-
-        Examples
-        --------
-        # Average a set of reference electrodes (e.g. a saved radiatum set), top 25%
-        high_theta = (HexMazeThetaV1 & key).get_high_theta_intervals(electrode=[57, 58, 65])
-
-        # Use a single electrode
-        high_theta = (HexMazeThetaV1 & key).get_high_theta_intervals(electrode="electrode 57")
-
-        # Filter a dataframe to high-theta times
-        mask = np.zeros(len(df), dtype=bool)
-        for start, end in high_theta:
-            mask |= (df.index >= start) & (df.index <= end)
-        df_high_theta = df[mask]
-        """
-        # Select the theta-power signal to threshold
-        if isinstance(electrode, (list, tuple, set, np.ndarray)):
-            # Average the per-channel theta power across a set of reference electrodes
-            # and threshold that (robust to small inter-channel phase differences).
-            power_series = self.average_theta_power(electrode)
-            power = power_series.to_numpy(dtype=float)
-            times = power_series.index.to_numpy()
-        else:
-            power_df = self.fetch1_theta_power()
-            times = power_df.index.to_numpy()
-            if electrode is not None:
-                # Accept 57, "57", or "electrode 57" -- normalize to the column name
-                column = f"electrode {int(str(electrode).split()[-1])}"
-                power = power_df[column].to_numpy(dtype=float)
-            else:
-                # Average across all electrodes (not recommended for sessions with
-                # many channels from mixed brain regions)
-                power = power_df.mean(axis=1).to_numpy(dtype=float)
-
-        # Threshold at the requested percentile
-        threshold = float(np.nanpercentile(power, threshold_percentile))
-        above = power >= threshold
-
-        # Find contiguous runs where power is above threshold.
-        # Pad with False at both ends so np.diff catches edges correctly.
-        padded = np.concatenate([[False], above, [False]])
-        diff = np.diff(padded.astype(int))
-        # diff==1: False→True transition, index = start of run in `times`
-        # diff==-1: True→False transition, index = exclusive end of run in `times`
-        starts = np.where(diff == 1)[0]
-        ends = np.where(diff == -1)[0]
-
-        intervals = []
-        for s, e in zip(starts, ends):
-            t_start = times[s]
-            t_end = times[e - 1]  # last sample in the run
-            if (t_end - t_start) >= min_duration:
-                intervals.append([t_start, t_end])
-
-        if not intervals:
-            return np.empty((0, 2))
-        return np.array(intervals)
-
-    @classmethod
-    def setup_theta_pipeline(
-        cls,
-        nwb_file_name: str,
-        lfp_electrode_group_name: str,
-        electrode_ids: list,
-        interval_list_name: str,
-        target_sampling_rate: int = 1000,
-        lfp_band_sampling_rate: int = 1000,
-        theta_filter_name: str = "Theta 5-11 Hz",
-        theta_band_edges: list = None,
-    ) -> dict:
-        """Set up the full LFP → theta pipeline for a given NWB file.
-
-        Creates all upstream entries needed before calling LFPBandV1.populate():
-          1. LFP lowpass filter matched to the file's actual raw sampling rate
-             (fetched from the Raw table — no hardcoding of session-specific rates)
-          2. LFP electrode group (the set of channels to filter)
-          3. LFPSelection entry (links electrode group + interval + filter)
-          4. Populates LFPV1 — broadband LFP downsampled to ~target_sampling_rate Hz
-             NOTE: This step takes ~2 hours locally for a full recording.
-          5. Theta bandpass filter matched to the actual LFP output sampling rate
-          6. LFPBandSelection entry (links LFP output + theta filter + interval)
-
-        Parameters
-        ----------
-        nwb_file_name : str
-            NWB file to process (must already be inserted in the database).
-        lfp_electrode_group_name : str
-            Name for the LFP electrode group — arbitrary but must be unique per file.
-        electrode_ids : list[int]
-            Electrode IDs (from the electrode table) to include in LFP processing.
-        interval_list_name : str
-            Name of the valid time interval to process (e.g. "00_r1" for Berke lab data).
-        target_sampling_rate : int
-            Desired output rate for the broadband LFP in Hz. Default 1000.
-            The actual rate may differ slightly due to integer decimation
-            (e.g. raw 29998 Hz with target 1000 → decimation=29 → actual 1034 Hz).
-        lfp_band_sampling_rate : int
-            Desired output rate for the theta-band LFP in Hz. Default 1000.
-        theta_filter_name : str
-            Name for the theta bandpass filter entry in FirFilterParameters.
-        theta_band_edges : list[float], optional
-            FIR band edges in Hz: [lo_pass, lo_stop, hi_stop, hi_pass].
-            Defaults to [4, 5, 11, 12] (standard theta band).
-
-        Returns
-        -------
-        dict
-            LFPBandSelection key — pass this to LFPBandV1().populate() to run theta
-            filtering, then to HexMazeThetaV1().populate() to compute and store results.
-        """
-        import spyglass.lfp as lfp
-
-        if theta_band_edges is None:
-            theta_band_edges = [4, 5, 11, 12]
-
-        # Get the actual raw sampling rate for this recording from the database.
-        # This varies per session (e.g. 29998 Hz for IM-1478 instead of the nominal 30000 Hz),
-        # so we always fetch it rather than hardcoding.
-        raw_sampling_rate = int(
-            np.round((sgc.Raw & {"nwb_file_name": nwb_file_name}).fetch1("sampling_rate"))
-        )
-
-        # The standard set of filters is designed for 30000 Hz data.
-        # We copy the band edges from the standard LFP filter and re-design it at the
-        # actual sampling rate, so cutoff frequencies are the same but filter coefficients differ.
-        sgc.FirFilterParameters().create_standard_filters()
-        standard_filter = sgc.FirFilterParameters() & {
-            "filter_name": "LFP 0-400 Hz",
-            "filter_sampling_rate": 30000,
-        }
-        lfp_band_edges = standard_filter.fetch1("filter_band_edges")
-
-        lfp_filter_name = f"LFP 0-400 Hz {raw_sampling_rate}Hz"
-        if not (
-            sgc.FirFilterParameters
-            & {"filter_name": lfp_filter_name, "filter_sampling_rate": raw_sampling_rate}
-        ):
-            sgc.FirFilterParameters().add_filter(
-                filter_name=lfp_filter_name,
-                fs=raw_sampling_rate,
-                filter_type="lowpass",
-                band_edges=lfp_band_edges,
-                comments=f"Standard LFP 0-400 Hz filter adapted for {raw_sampling_rate} Hz data",
-            )
-
-        # Create the LFP electrode group (which channels to compute LFP for)
-        lfp.lfp_electrode.LFPElectrodeGroup.create_lfp_electrode_group(
-            nwb_file_name=nwb_file_name,
-            group_name=lfp_electrode_group_name,
-            electrode_list=electrode_ids,
-            skip_duplicates=True,
-        )
-
-        # Insert LFPSelection: links electrode group + valid time interval + filter into one entry
-        lfp_s_key = {
-            "nwb_file_name": nwb_file_name,
-            "lfp_electrode_group_name": lfp_electrode_group_name,
-            "target_interval_list_name": interval_list_name,
-            "filter_name": lfp_filter_name,
-            "filter_sampling_rate": raw_sampling_rate,
-            "target_sampling_rate": target_sampling_rate,
-        }
-        lfp.v1.LFPSelection.insert1(lfp_s_key, skip_duplicates=True)
-
-        # Populate LFPV1: applies the LFP filter and downsamples to ~target_sampling_rate Hz.
-        # NOTE: For full recordings this takes ~2 hours when run locally.
-        lfp.v1.LFPV1().populate(lfp_s_key)
-
-        # Get the LFP merge ID so we can reference this result downstream
-        lfp_key = {
-            "merge_id": (lfp.LFPOutput.LFPV1() & lfp_s_key).fetch1("merge_id")
-        }
-
-        # The actual LFP sampling rate after integer decimation
-        # (may differ from target, e.g. 29998 → 1034 Hz with decimation=29)
-        lfp_sampling_rate = int(
-            lfp.LFPOutput.merge_get_parent(lfp_key).fetch1("lfp_sampling_rate")
-        )
-
-        # Create the theta bandpass filter matched to the actual LFP output sampling rate.
-        # We can't reuse a filter entry from a different session if their LFP rates differ.
-        if not (
-            sgc.FirFilterParameters
-            & {"filter_name": theta_filter_name, "filter_sampling_rate": lfp_sampling_rate}
-        ):
-            sgc.common_filter.FirFilterParameters().add_filter(
-                theta_filter_name,
-                lfp_sampling_rate,
-                "bandpass",
-                theta_band_edges,
-                f"Theta 5-11 Hz bandpass filter for {lfp_sampling_rate} Hz LFP data",
-            )
-
-        # Insert LFPBandSelection: links LFP output + theta filter + valid time interval
-        LFPBandSelection().set_lfp_band_electrodes(
-            nwb_file_name=nwb_file_name,
-            lfp_merge_id=lfp_key["merge_id"],
-            electrode_list=electrode_ids,
-            filter_name=theta_filter_name,
-            interval_list_name=interval_list_name,
-            reference_electrode_list=[-1],  # -1 means no reference electrode
-            lfp_band_sampling_rate=lfp_band_sampling_rate,
-        )
-
-        # set_lfp_band_electrodes stores lfp_band_sampling_rate as
-        # lfp_sampling_rate // decimation (integer floor division), not the
-        # target we passed in. When the LFP rate isn't a clean multiple of the
-        # target (e.g. 1034 Hz target 1000 → decimation=1 → stored rate 1034),
-        # querying with the target value returns 0 rows.
-        actual_lfp_band_rate = lfp_sampling_rate // (lfp_sampling_rate // lfp_band_sampling_rate)
-
-        # Return the LFPBandSelection key.
-        # Pass this to LFPBandV1().populate() then HexMazeThetaV1().populate().
-        lfp_band_key = (
-            LFPBandSelection
-            & {
-                "lfp_merge_id": lfp_key["merge_id"],
-                "filter_name": theta_filter_name,
-                "lfp_band_sampling_rate": actual_lfp_band_rate,
-            }
-        ).fetch1("KEY")
-
-        return lfp_band_key
-
-
-@schema
-class HexMazeThetaReference(SpyglassMixin, dj.Manual):
-    """A named set of reference electrodes for a HexMazeThetaV1 entry.
-
-    Lets you save the electrodes you chose for a layer (e.g. stratum radiatum) so that
-    later you can pull theta phase or power as the AVERAGE of those electrodes, without
-    re-running the selection. Averaging is done on the complex analytic signal (the
-    correct way to combine phases), then phase and power are derived from that average.
-
-    Typical usage:
-        # save a selection (electrode_ids can be ints or strings like "57")
-        HexMazeThetaReference.add_reference(
-            key={"nwb_file_name": "IM-1478_20220727_.nwb"},
-            reference_name="radiatum",
-            electrode_ids=[57, 58, 65],
-        )
-
-        # later, fetch the averaged theta phase / power for that set
-        ref = HexMazeThetaReference & {"nwb_file_name": "IM-1478_20220727_.nwb",
-                                       "reference_name": "radiatum"}
-        phase = ref.fetch1_reference_phase()   # radians [0, 2π], indexed by time
-        power = ref.fetch1_reference_power()    # amplitude², indexed by time
-    """
-
-    definition = """
-    -> HexMazeThetaV1
-    reference_name : varchar(64)    # label for this electrode set, e.g. "radiatum"
-    ---
-    electrode_ids  : blob           # list of electrode ids to average over
-    description="" : varchar(255)   # optional note about how the set was chosen
-    """
-
-    @classmethod
-    def add_reference(cls, key, reference_name, electrode_ids, description="", replace=False):
-        """Save a set of reference electrodes for one HexMazeThetaV1 entry.
-
-        Parameters
-        ----------
-        key : dict
-            Restriction that uniquely identifies one HexMazeThetaV1 row
-            (e.g. {"nwb_file_name": "IM-1478_20220727_.nwb"}).
-        reference_name : str
-            Label for this set (e.g. "radiatum"). Part of the primary key, so you can
-            store several named sets per session.
-        electrode_ids : list
-            Electrode ids to average over. Ints or strings ("57") both work.
-        description : str
-            Optional note (e.g. "k=6 cluster 0, stratum radiatum").
-        replace : bool
-            If True, overwrite an existing set stored under the same name.
-        """
-        theta_key = (HexMazeThetaV1 & key).fetch1("KEY")
-        cls.insert1(
-            {
-                **theta_key,
-                "reference_name": reference_name,
-                "electrode_ids": [int(e) for e in electrode_ids],
-                "description": description,
-            },
-            replace=replace,
-        )
-
-    def fetch1_reference_analytic(self) -> pd.Series:
-        """Complex analytic signal averaged across the saved reference electrodes."""
-        return (HexMazeThetaV1 & self).average_analytic_signal(self.fetch1("electrode_ids"))
-
-    def fetch1_reference_phase(self) -> pd.Series:
-        """Averaged theta phase (radians [0, 2π]) across the saved reference electrodes."""
-        return (HexMazeThetaV1 & self).average_theta_phase(self.fetch1("electrode_ids"))
-
-    def fetch1_reference_power(self) -> pd.Series:
-        """Averaged theta power (amplitude²) across the saved reference electrodes."""
-        return (HexMazeThetaV1 & self).average_theta_power(self.fetch1("electrode_ids"))
