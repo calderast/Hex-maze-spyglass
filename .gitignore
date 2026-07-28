@@ -48,3 +48,6 @@ notebooks/analysis/figures/*
 *.png
 *.pkl
 *.csv
+# Analysis and dev notebooks live in the private Hex-maze-spyglass-private repo
+notebooks/analysis/
+notebooks/dev/
