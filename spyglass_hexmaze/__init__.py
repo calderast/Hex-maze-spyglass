@@ -35,3 +35,8 @@ __all__ = [
     "hex_maze_decoding",
     "berke_fiber_photometry",
 ]
+
+# spikesorting_helpers is deliberately NOT imported here: it pulls in both the v0 and v1
+# spikesorting modules, which is slow and unnecessary for anyone who only wants the tables.
+# Import it directly instead:
+#     from spyglass_hexmaze.spikesorting_helpers import fetch_good_units

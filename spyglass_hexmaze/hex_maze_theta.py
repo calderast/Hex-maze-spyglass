@@ -122,27 +122,155 @@ class HexMazeThetaV1(SpyglassMixin, dj.Computed):
 
         self.insert1(key, skip_duplicates=True)
 
+    def _fetch1_nwb(self) -> dict:
+        """fetch_nwb() for exactly one entry, erroring if the restriction isn't unique.
+
+        Returns:
+            dict: The single fetched entry.
+
+        Raises:
+            ValueError: If the restriction matches zero or more than one entry.
+        """
+        n = len(self)
+        if n != 1:
+            raise ValueError(
+                f"Expected exactly 1 HexMazeThetaV1 entry, found {n}. Restrict by "
+                "target_interval_list_name as well as nwb_file_name, e.g. "
+                "{'nwb_file_name': 'Lily20251217_.nwb', 'target_interval_list_name': '05_r3'}"
+            )
+        return self.fetch_nwb()[0]
+
     def fetch1_analytic_signal(self) -> pd.DataFrame:
         """Return the analytic signal DataFrame, indexed by time.
 
         Columns are 'electrode N_real' and 'electrode N_imag' for each electrode N.
         To reconstruct complex signal: df['electrode 5_real'] + 1j * df['electrode 5_imag']
         """
-        return self.fetch_nwb()[0]["analytic_signal"].set_index("time")
+        return self._fetch1_nwb()["analytic_signal"].set_index("time")
 
     def fetch1_theta_phase(self) -> pd.DataFrame:
         """Return instantaneous theta phase in radians [0, 2π], indexed by time.
 
         Columns are 'electrode N' for each electrode N.
         """
-        return self.fetch_nwb()[0]["theta_phase"].set_index("time")
+        return self._fetch1_nwb()["theta_phase"].set_index("time")
 
     def fetch1_theta_power(self) -> pd.DataFrame:
         """Return instantaneous theta power (amplitude²), indexed by time.
 
         Columns are 'electrode N' for each electrode N.
         """
-        return self.fetch_nwb()[0]["theta_power"].set_index("time")
+        return self._fetch1_nwb()["theta_power"].set_index("time")
+
+    def _read_stored_columns(self, object_id_attribute: str, column_names: list) -> dict:
+        """Read named columns out of one stored table without loading the whole thing.
+
+        The fetch1_* methods above load the entire table, which takes FOREVER. 
+        The analytic signal is two float64 columns per electrode, so one epoch of a
+        384-channel session is ~21 GB and takes ~10 minutes to load from /stelmo. Sad.
+        But HDF5 stores each column as its own dataset, so reading just the columns 
+        we need instead takes under a second! yay!
+
+        Parameters:
+            object_id_attribute (str): Which stored object to read — "analytic_signal_object_id",
+                "theta_phase_object_id", or "theta_power_object_id"
+            column_names (list[str]): Column names to read, e.g. ["time", "electrode 41_real"]
+
+        Returns:
+            dict: {column_name: np.ndarray} for each requested column.
+        """
+        import h5py
+        from spyglass.common import AnalysisNwbfile
+
+        # fetch1 here also enforces that the restriction picks exactly one entry
+        analysis_file_name, object_id = self.fetch1("analysis_file_name", object_id_attribute)
+        path = AnalysisNwbfile.get_abs_path(analysis_file_name)
+
+        columns = {}
+        with h5py.File(path, "r") as f:
+            # The stored table is an HDF5 group tagged with the object id we recorded
+            group = None
+
+            def visit(name, obj):
+                nonlocal group
+                if isinstance(obj, h5py.Group) and obj.attrs.get("object_id") == object_id:
+                    group = obj
+
+            f.visititems(visit)
+            if group is None:
+                raise ValueError(f"No object {object_id} in {path}")
+
+            missing = [c for c in column_names if c not in group]
+            if missing:
+                raise KeyError(f"Columns {missing} not in the stored table (has {len(group)} columns)")
+
+            for column in column_names:
+                columns[column] = group[column][:]
+
+        return columns
+
+    def fetch_analytic_signal(self, electrode_ids) -> pd.DataFrame:
+        """Analytic signal for JUST the given electrodes, indexed by time.
+
+        Same content as fetch1_analytic_signal() restricted to some electrodes, but it reads
+        only those columns off disk rather than the whole table (WAY faster). 
+        Use this whenever you know which electrodes you want.
+
+        Parameters:
+            electrode_ids (list): Electrode ids to read. Ints or strings ("57") both work.
+
+        Returns:
+            pd.DataFrame: Time-indexed, with 'electrode N_real' / 'electrode N_imag' columns
+                for each requested electrode.
+        """
+        electrode_ids = [int(e) for e in electrode_ids]
+        wanted = [f"electrode {e}_{part}" for e in electrode_ids for part in ("real", "imag")]
+        data = self._read_stored_columns("analytic_signal_object_id", ["time"] + wanted)
+        return pd.DataFrame(
+            {name: data[name] for name in wanted},
+            index=pd.Index(data["time"], name="time"),
+        )
+
+    def fetch_theta_phase(self, electrode_ids) -> pd.DataFrame:
+        """Theta phase for JUST the given electrodes, indexed by time.
+
+        Same content as fetch1_theta_phase() restricted to some electrodes, but it reads
+        only those columns off disk rather than the whole table (WAY faster).
+        Use this whenever you know which electrodes you want.
+
+        Parameters:
+            electrode_ids (list): Electrode ids to read. Ints or strings ("57") both work.
+
+        Returns:
+            pd.DataFrame: Time-indexed, with an 'electrode N' column per requested electrode.
+                Phase is in radians [0, 2π], same as fetch1_theta_phase().
+        """
+        wanted = [f"electrode {int(e)}" for e in electrode_ids]
+        data = self._read_stored_columns("theta_phase_object_id", ["time"] + wanted)
+        return pd.DataFrame(
+            {name: data[name] for name in wanted},
+            index=pd.Index(data["time"], name="time"),
+        )
+
+    def fetch_theta_power(self, electrode_ids) -> pd.DataFrame:
+        """Theta power for JUST the given electrodes, indexed by time.
+
+        Same content as fetch1_theta_power() restricted to some electrodes, but it reads
+        only those columns off disk rather than the whole table (WAY faster). 
+        Use this whenever you know which electrodes you want.
+
+        Parameters:
+            electrode_ids (list): Electrode ids to read. Ints or strings ("57") both work.
+
+        Returns:
+            pd.DataFrame: Time-indexed, with an 'electrode N' column per requested electrode.
+        """
+        wanted = [f"electrode {int(e)}" for e in electrode_ids]
+        data = self._read_stored_columns("theta_power_object_id", ["time"] + wanted)
+        return pd.DataFrame(
+            {name: data[name] for name in wanted},
+            index=pd.Index(data["time"], name="time"),
+        )
 
     def average_analytic_signal(self, electrode_list) -> pd.Series:
         """Average the complex analytic signal across a set of electrodes, indexed by time.
@@ -151,7 +279,7 @@ class HexMazeThetaV1(SpyglassMixin, dj.Computed):
         channels: in-phase theta adds, noise cancels. electrode_list entries can be
         ints or strings ("57").
         """
-        analytic = self.fetch1_analytic_signal()
+        analytic = self.fetch_analytic_signal(electrode_list)
         z = sum(
             analytic[f"electrode {int(e)}_real"] + 1j * analytic[f"electrode {int(e)}_imag"]
             for e in electrode_list
@@ -172,9 +300,8 @@ class HexMazeThetaV1(SpyglassMixin, dj.Computed):
         combined waveform instead (power of the average, which sags if channels drift out
         of phase) use np.abs(self.average_analytic_signal(electrode_list)) ** 2.
         """
-        power_df = self.fetch1_theta_power()
-        columns = [f"electrode {int(e)}" for e in electrode_list]
-        return power_df[columns].mean(axis=1).rename("theta_power")
+        power_df = self.fetch_theta_power(electrode_list)
+        return power_df.mean(axis=1).rename("theta_power")
 
     def get_high_theta_intervals(
         self,
@@ -220,17 +347,20 @@ class HexMazeThetaV1(SpyglassMixin, dj.Computed):
             power_series = self.average_theta_power(electrode)
             power = power_series.to_numpy(dtype=float)
             times = power_series.index.to_numpy()
+        elif electrode is not None:
+            # Accept 57, "57", or "electrode 57" -- normalize to the electrode id, then read
+            # only that one column rather than the whole table
+            power_df = self.fetch_theta_power([int(str(electrode).split()[-1])])
+            times = power_df.index.to_numpy()
+            power = power_df.iloc[:, 0].to_numpy(dtype=float)
         else:
+            # Average across all electrodes (not recommended for sessions with
+            # many channels from mixed brain regions). This is the one case that
+            # actually needs every column, so it still reads the full table.
+            # But we should always use the reference set and never actually do this.
             power_df = self.fetch1_theta_power()
             times = power_df.index.to_numpy()
-            if electrode is not None:
-                # Accept 57, "57", or "electrode 57" -- normalize to the column name
-                column = f"electrode {int(str(electrode).split()[-1])}"
-                power = power_df[column].to_numpy(dtype=float)
-            else:
-                # Average across all electrodes (not recommended for sessions with
-                # many channels from mixed brain regions)
-                power = power_df.mean(axis=1).to_numpy(dtype=float)
+            power = power_df.mean(axis=1).to_numpy(dtype=float)
 
         # Threshold at the requested percentile
         threshold = float(np.nanpercentile(power, threshold_percentile))
