@@ -31,7 +31,7 @@ dependencies = [
     "datajoint",
     "pynwb",
     "spyglass-neuro>=0.5.4",
-    "hex-maze-neuro",
+    "hex-maze-neuro==1.1.6",
     "non-local-detector>=0.6.9",
     "ndx-fiber-photometry==0.1.0",
     "ndx-ophys-devices"
