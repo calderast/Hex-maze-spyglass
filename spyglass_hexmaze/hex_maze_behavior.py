@@ -664,20 +664,22 @@ class HexCentroids(dj.Imported):
         )
         return {hex_id: (x, y) for hex_id, x, y in zip(hexes, x_pixels, y_pixels)}
 
+    @staticmethod
+    def _core_hexes_only(centroids_dict):
+        """Drop the side hexes by the reward ports and cast the remaining hex IDs to ints."""
+        return {
+            int(hex_id): centroid
+            for hex_id, centroid in centroids_dict.items()
+            if "_left" not in hex_id and "_right" not in hex_id
+        }
+
     @classmethod
     def get_core_hex_centroids_dict_cm(cls, session_key):
         """
         Helper to return a dictionary mapping each hex ID to its (x_cm, y_cm) tuple.
         Includes core hexes only (side hexes by reward ports are removed)
         """
-        centroids_dict = cls.get_hex_centroids_dict_cm(session_key)
-        # Remove side hex centroids and cast strings to ints
-        centroids_dict = {
-            int(k): v
-            for k, v in centroids_dict.items()
-            if "_left" not in k and "_right" not in k
-        }
-        return centroids_dict
+        return cls._core_hexes_only(cls.get_hex_centroids_dict_cm(session_key))
 
     @classmethod
     def get_core_hex_centroids_dict_pixels(cls, session_key):
@@ -685,14 +687,7 @@ class HexCentroids(dj.Imported):
         Helper to return a dictionary mapping each hex ID to its (x_pixels, y_pixels) tuple.
         Includes core hexes only (side hexes by reward ports are removed)
         """
-        centroids_dict = cls.get_hex_centroids_dict_pixels(session_key)
-        # Remove side hex centroids and cast strings to ints
-        centroids_dict = {
-            int(k): v
-            for k, v in centroids_dict.items()
-            if "_left" not in k and "_right" not in k
-        }
-        return centroids_dict
+        return cls._core_hexes_only(cls.get_hex_centroids_dict_pixels(session_key))
 
     class HexCentroidsPart(dj.Part):
         definition = """
@@ -1440,3 +1435,118 @@ class HexPath(SpyglassMixin, dj.Computed):
         plt.show()
 
         return axes
+
+## These are for Steph's hex value modeling!
+
+def describe_position_merge_id(pos_merge_id):
+    """Describe where a PositionOutput merge_id came from.
+
+    Returns a string naming the source table and the parameters that produced this
+    position, e.g. "TrodesPosV1(interval_list_name='pos 0 valid times',
+    trodes_pos_params_name='berke_double_led')".
+    """
+    source = PositionOutput.merge_get_parent({"merge_id": pos_merge_id})
+    source_key = source.fetch1("KEY")
+    params = ", ".join(
+        f"{attr}={value!r}"
+        for attr, value in source_key.items()
+        if attr != "nwb_file_name"
+    )
+    return f"{dj.utils.to_camel_case(source.table_name.lstrip('_'))}({params})"
+
+
+def get_trajectories_and_rewards(nwb_file_name, epoch, pos_merge_id=None):
+    """Get the hex trajectory and reward outcome for each trial in an epoch.
+
+    Returns (trajectories, rewards), both ordered by epoch_trial_num:
+    trajectories is a list of lists (the hexes the rat visited, in order, for each
+    trial), and rewards is a list of 1 (rewarded) or 0 (unrewarded), one per trial.
+
+    An epoch can have more than one HexPath entry (HexPath is keyed by pos_merge_id,
+    so position computed more than one way gives more than one entry). If they all
+    give the same trajectories it doesn't matter which one we use, so we use them.
+    If they disagree, specify which position to use via pos_merge_id. Either way, the
+    position parameters behind each pos_merge_id are printed so you can tell them apart.
+    """
+    epoch_key = {"nwb_file_name": nwb_file_name, "epoch": epoch}
+    hex_path_key = dict(epoch_key)
+    if pos_merge_id is not None:
+        hex_path_key["pos_merge_id"] = pos_merge_id
+
+    hex_path_keys = (HexPath & hex_path_key).fetch("KEY")
+    if len(hex_path_keys) == 0:
+        raise ValueError(f"No HexPath entry for {nwb_file_name} epoch {epoch}")
+
+    # Hexes visited per trial, for each HexPath entry matching this key
+    trajectories_per_entry = []
+    for entry_key in hex_path_keys:
+        hex_path_df = (HexPath & entry_key).fetch1_dataframe()
+        trajectories_per_entry.append(
+            hex_path_df.sort_values(["epoch_trial_num", "hex_in_trial"])
+            .groupby("epoch_trial_num")["hex"]
+            .apply(lambda hexes: [int(h) for h in hexes])
+        )
+
+    trajectories_by_trial = trajectories_per_entry[0]
+    entries_agree = all(
+        other.equals(trajectories_by_trial) for other in trajectories_per_entry[1:]
+    )
+
+    if len(hex_path_keys) > 1:
+        # Show what distinguishes the entries so the caller can pick one by pos_merge_id
+        entry_descriptions = "\n".join(
+            f"  {entry_key['pos_merge_id']}: "
+            f"{describe_position_merge_id(entry_key['pos_merge_id'])}"
+            for entry_key in hex_path_keys
+        )
+        if not entries_agree:
+            raise ValueError(
+                f"The {len(hex_path_keys)} HexPath entries for {nwb_file_name} epoch "
+                f"{epoch} give different trajectories. Pass pos_merge_id to choose "
+                f"one of:\n{entry_descriptions}"
+            )
+        print(
+            f"{nwb_file_name} epoch {epoch} has {len(hex_path_keys)} HexPath entries "
+            f"that all give the same trajectories:\n{entry_descriptions}"
+        )
+
+    # Reward outcome per trial
+    reward_by_trial = dict(
+        zip(*(HexMazeBlock.Trial & epoch_key).fetch("epoch_trial_num", "reward"))
+    )
+
+    trajectories = [list(t) for t in trajectories_by_trial]
+    rewards = [int(reward_by_trial[t]) for t in trajectories_by_trial.index]
+    return trajectories, rewards
+
+
+def save_trajectories_and_rewards(trajectories, rewards, csv_path):
+    """Save trajectories and rewards to a csv, one row per trial.
+
+    Columns are trial (1-indexed position in the lists), reward, and trajectory
+    (the hexes for that trial, space-separated).
+    """
+    if len(trajectories) != len(rewards):
+        raise ValueError(
+            f"Got {len(trajectories)} trajectories but {len(rewards)} rewards"
+        )
+    df = pd.DataFrame(
+        {
+            "trial": range(1, len(trajectories) + 1),
+            "reward": rewards,
+            "trajectory": [" ".join(str(h) for h in traj) for traj in trajectories],
+        }
+    )
+    df.to_csv(csv_path, index=False)
+    return csv_path
+
+
+def load_trajectories_and_rewards(csv_path):
+    """Load a csv written by save_trajectories_and_rewards.
+
+    Returns (trajectories, rewards) in the same form as get_trajectories_and_rewards.
+    """
+    df = pd.read_csv(csv_path)
+    trajectories = [[int(h) for h in traj.split()] for traj in df["trajectory"]]
+    rewards = [int(r) for r in df["reward"]]
+    return trajectories, rewards

@@ -22,21 +22,25 @@ try:
                 return None
         DeviceMapper.constructor_args["model"] = _safe_model_fn
 except Exception:
-    pass  # older pynwb without DeviceMapper — no patch needed
+    pass  # older pynwb without DeviceMapper, no patch needed
 
 from spyglass_hexmaze import (
     berke_fiber_photometry,
     hex_maze_behavior,
     hex_maze_decoding,
+    theta_sweeps,
 )
 
 __all__ = [
     "hex_maze_behavior",
     "hex_maze_decoding",
     "berke_fiber_photometry",
+    "theta_sweeps",
 ]
 
 # spikesorting_helpers is deliberately NOT imported here: it pulls in both the v0 and v1
 # spikesorting modules, which is slow and unnecessary for anyone who only wants the tables.
-# Import it directly instead:
+# spike_theta_phase depends on it, so it is left out for the same reason.
+# Import either one directly instead:
 #     from spyglass_hexmaze.spikesorting_helpers import fetch_good_units
+#     from spyglass_hexmaze.spike_theta_phase import compute_session_metrics

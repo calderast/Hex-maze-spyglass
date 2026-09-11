@@ -20,6 +20,7 @@ from spyglass_hexmaze.hex_maze_behavior import HexCentroids, HexMazeBlock
 
 from hexmaze import (
     are_points_in_maze,
+    classify_hexes_by_barrier_change,
     classify_maze_hexes,
     divide_into_thirds,
     get_all_choice_points,
@@ -33,6 +34,7 @@ from hexmaze import (
     maze_to_barrier_set,
     maze_to_graph,
     get_hex_distance,
+    get_safe_hex_distance,
     plot_hex_maze,
 )
 
@@ -314,6 +316,78 @@ def get_epoch_blocks_in_order(nwb_file_name, epoch):
         )
 
     return sorted(blocks, key=lambda b: b["block"])
+
+
+def epoch_trials_with_bounds(nwb_file_name, epoch):
+    """
+    Every trial in an epoch with its time bounds, ordered by start time.
+
+    Trial bounds live in IntervalList, reached through the interval name the trial points at.
+    Fetching them in ONE query and looking them up in memory matters: an epoch can have
+    hundreds of trials, and a fetch1 per trial is that many round trips to the database,
+    which under load is minutes rather than seconds.
+
+    Parameters:
+        nwb_file_name (str): The session the epoch belongs to
+        epoch (int): The epoch to get trials for
+
+    Returns:
+        list[dict]: One dict per trial ordered by start_time, with every HexMazeBlock.Trial
+            column plus "start_time" and "end_time". Trials whose interval carries no valid
+            times are left out.
+    """
+    trial_restriction = HexMazeBlock.Trial & {"nwb_file_name": nwb_file_name, "epoch": epoch}
+    trials = trial_restriction.fetch(as_dict=True)
+    if not trials:
+        return []
+
+    # Restrict IntervalList to the intervals THESE trials point at rather than taking the whole
+    # session. IntervalList and HexMazeBlock.Trial share nwb_file_name and interval_list_name,
+    # so the restriction below matches on exactly those two. Besides being a smaller fetch, it
+    # steps around unrelated junk rows: Toby20250318_ carries a scratch interval ("test decoding
+    # interval_") whose stored blob will not decode, and one bad row fails the entire fetch.
+    intervals = (IntervalList & trial_restriction).fetch(
+        "interval_list_name", "valid_times", as_dict=True
+    )
+
+    # valid_times is usually (n_intervals, 2), but a single-interval row can come back flat as
+    # (2,) -- atleast_2d makes [0][0] the first start and [-1][-1] the last end in both cases
+    bounds = {
+        row["interval_list_name"]: (
+            np.atleast_2d(row["valid_times"])[0][0],
+            np.atleast_2d(row["valid_times"])[-1][-1],
+        )
+        for row in intervals
+        if len(row["valid_times"])
+    }
+
+    with_bounds = [
+        {**trial, "start_time": bounds[trial["interval_list_name"]][0],
+         "end_time": bounds[trial["interval_list_name"]][1]}
+        for trial in trials
+        if trial["interval_list_name"] in bounds
+    ]
+    return sorted(with_bounds, key=lambda trial: trial["start_time"])
+
+
+def maze_by_block(nwb_file_name, epoch):
+    """
+    The maze each block of an epoch ran, as {block: config_id}.
+
+    One query for the whole epoch, so a per-trial loop can look the maze up in memory
+    instead of asking the database again for every trial.
+
+    Parameters:
+        nwb_file_name (str): The session the epoch belongs to
+        epoch (int): The epoch to get block mazes for
+
+    Returns:
+        dict: block number -> config_id
+    """
+    blocks, configs = (HexMazeBlock & {"nwb_file_name": nwb_file_name, "epoch": epoch}).fetch(
+        "block", "config_id"
+    )
+    return dict(zip(blocks, configs))
 
 
 def blocks_ago_label(blocks_ago):
@@ -747,30 +821,15 @@ class HexMazeDecodedHexPath(SpyglassMixin, dj.Computed):
         epoch = key["epoch"]
 
         # Get trials for this nwb+epoch
-        trials = HexMazeBlock().Trial() & {"nwb_file_name": nwb_file, "epoch": epoch}
+        trials = epoch_trials_with_bounds(nwb_file, epoch)
+        maze_of_block = maze_by_block(nwb_file, epoch)
 
         # Accumulate per-trial dataframes
         all_hex_paths = []
 
         for trial in trials:
-            # Get trial time bounds
-            trial_start, trial_end = (
-                sgc.IntervalList
-                & {
-                    "nwb_file_name": trial["nwb_file_name"],
-                    "interval_list_name": trial["interval_list_name"],
-                }
-            ).fetch1("valid_times")[0]
-
-            # Get maze configuration and attributes
-            maze = (
-                HexMazeBlock()
-                & {
-                    "nwb_file_name": trial["nwb_file_name"],
-                    "block": trial["block"],
-                    "epoch": trial["epoch"],
-                }
-            ).fetch1("config_id")
+            trial_start, trial_end = trial["start_time"], trial["end_time"]
+            maze = maze_of_block[trial["block"]]
 
             # Filter decoded position data to this trial
             trial_df = hex_position_df.loc[trial_start:trial_end].copy()
@@ -1081,7 +1140,7 @@ class HexMazeDecodedPositionHexAnnotated(SpyglassMixin, dj.Computed):
     """
     Adds per-timepoint maze annotations to HexMazeDecodedPositionHex.
     Same columns as HexMazeDecodedHexPath (hex_type, maze_portion, hexes_from_start/end/choice, etc.)
-    but without aggregation — one row per timepoint, not per hex segment.
+    but without aggregation: one row per timepoint, not per hex segment.
     This is nice so we can filter by speed, spatial coverage, etc. at each time point
     """
 
@@ -1120,7 +1179,8 @@ class HexMazeDecodedPositionHexAnnotated(SpyglassMixin, dj.Computed):
         hex_position_df["decode_hexes_from_choice"] = -100
 
         # Get trials for this nwb+epoch
-        trials = HexMazeBlock().Trial() & {"nwb_file_name": nwb_file, "epoch": epoch}
+        trials = epoch_trials_with_bounds(nwb_file, epoch)
+        maze_of_block = maze_by_block(nwb_file, epoch)
 
         port_map = {"A": 1, "B": 2, "C": 3}
 
@@ -1185,24 +1245,8 @@ class HexMazeDecodedPositionHexAnnotated(SpyglassMixin, dj.Computed):
             return choice_dist_cache[cache_key]
 
         for trial in trials:
-            # Get trial time bounds
-            trial_start, trial_end = (
-                sgc.IntervalList
-                & {
-                    "nwb_file_name": trial["nwb_file_name"],
-                    "interval_list_name": trial["interval_list_name"],
-                }
-            ).fetch1("valid_times")[0]
-
-            # Get maze configuration for this block
-            maze = (
-                HexMazeBlock()
-                & {
-                    "nwb_file_name": trial["nwb_file_name"],
-                    "block": trial["block"],
-                    "epoch": trial["epoch"],
-                }
-            ).fetch1("config_id")
+            trial_start, trial_end = trial["start_time"], trial["end_time"]
+            maze = maze_of_block[trial["block"]]
 
             # Filter to this trial's timepoints
             trial_df = hex_position_df.loc[trial_start:trial_end]
@@ -1392,16 +1436,21 @@ class HexMazeDecodedHexPathBarrierChange(SpyglassMixin, dj.Computed):
             )
             after_conv = get_hexes_before_divergence(old_maze, new_maze, end_port, start_port)
 
-            # Build hex -> classification lookup
+            # Build hex -> classification lookup.
+            # Order matters: later assignments overwrite earlier ones, so the two shared
+            # classes go first and the path classes last. This keeps a hex that falls in more
+            # than one set labeled the same for A -> C as for C -> A, since reversing the
+            # ports swaps the before_divergence and after_convergence sets while
+            # get_optimal_path_hexes_after_divergence is direction-symmetric.
             hex_class = {}
             for h in before_div:
                 hex_class[h] = "before_divergence"
+            for h in after_conv:
+                hex_class[h] = "after_convergence"
             for h in hexes_on_old_path:
                 hex_class[h] = "old_path"
             for h in hexes_on_new_path:
                 hex_class[h] = "new_path"
-            for h in after_conv:
-                hex_class[h] = "after_convergence"
 
             # Classify actual and decoded hexes (default to "other" if not in any category)
             hex_path_df.loc[trial_mask, "barrier_change_hex_class"] = [
@@ -1422,6 +1471,326 @@ class HexMazeDecodedHexPathBarrierChange(SpyglassMixin, dj.Computed):
 
     def fetch1_dataframe(self):
         return self.fetch_nwb()[0]["barrier_change_hex_path"]
+
+
+# Every barrier change class classify_hexes_by_barrier_change can return, plus "barrier" for a
+# hex closed in the new maze that is not on the old path either, and "None" for a timepoint we
+# did not classify. HexMazeDecodedPositionHexBarrierChange stores the INDEX into this tuple
+# rather than the string: an epoch is a few million timepoints, and four columns of variable
+# length strings is ~800 MB of HDF5 against ~15 MB as int8. fetch1_dataframe maps the codes
+# back, so only the stored file ever sees them. Append to this tuple, never reorder it --
+# the codes in already-populated entries are positions in it.
+BARRIER_CHANGE_CLASSES = (
+    "None",
+    "before_divergence",
+    "old_path",
+    "new_path",
+    "after_convergence",
+    "shared",
+    "other",
+    "barrier",
+)
+
+
+def _hex_to_class(hex_classes):
+    """Flip classify_hexes_by_barrier_change's {class: {hexes}} into a {hex: class} lookup.
+
+    -100 (the "no hex assigned" sentinel used throughout these tables) is mapped to "None"
+    so it never picks up a real class label.
+
+    Parameters:
+        hex_classes (dict[str, set[int]]): As returned by classify_hexes_by_barrier_change
+
+    Returns:
+        dict: hex -> class name, plus the -100 sentinel -> "None"
+    """
+    return {-100: "None", **{h: name for name, hexes in hex_classes.items() for h in hexes}}
+
+
+def barrier_change_lookups(old_maze, new_maze, start_port, end_port):
+    """
+    Hex classes and signed distance from the divergence point, for one barrier change
+    and one pair of reward ports.
+
+    Two classifications are returned. The strict one is classify_hexes_by_barrier_change at
+    its defaults, where "old_path"/"new_path" mean strictly on that optimal route. The wide
+    one passes dead_end_ok=True and non_optimal_ok=True, which flood-fills each class out to
+    everything the rat can reach in that stretch of the maze. Decoded position wanders off
+    the optimal route constantly, so the wide version is usually what a decode should be
+    scored against, while the strict one answers "was this the actual route".
+
+    Parameters:
+        old_maze (str): config_id of the maze before the barrier change
+        new_maze (str): config_id of the maze after the barrier change (the one the rat is in)
+        start_port (str or int): Trial start port (A/B/C or 1/2/3)
+        end_port (str or int): Trial end port (A/B/C or 1/2/3)
+
+    Returns:
+        strict (dict): hex -> class, route classes meaning strictly on the optimal route
+        wide (dict): hex -> class, route classes widened to the corridor around the route
+        distance (dict): hex -> hex distance from the path divergence point, negative on the
+            approach side and positive past it. Measured through the maze the hex belongs to:
+            the old maze for "old_path", the new maze for everything else, with the hex itself
+            opened if it is a barrier there. A hex that maze cannot reach at all (one on an
+            island) is left out. Empty when the route between these two ports did not change
+            (there is no divergence point to measure from).
+    """
+    strict = _hex_to_class(
+        classify_hexes_by_barrier_change(old_maze, new_maze, start_port, end_port)
+    )
+    wide = _hex_to_class(
+        classify_hexes_by_barrier_change(
+            old_maze, new_maze, start_port, end_port, dead_end_ok=True, non_optimal_ok=True
+        )
+    )
+
+    divergence_hex = get_path_divergence_point(old_maze, new_maze, start_port, end_port)
+    if divergence_hex is None:
+        # The route between these ports is the same in both mazes, so nothing diverged
+        # (classify_hexes_by_barrier_change calls the whole corridor "shared")
+        return strict, wide, {}
+
+    # Measure each hex in the maze it actually belongs to. classify_hexes_by_barrier_change
+    # builds every class except "old_path" out of hexes that are open in the new maze -- the
+    # maze the rat is in -- so that is where those are measured. The old path is the exception:
+    # it is the route through the OLD maze, and the barrier change blocks one of its hexes, so
+    # measuring it in the new maze detours around the block (or, for the blocked hex itself,
+    # takes a route that exists in neither maze). The wide classification picks the maze, so
+    # that a hex hanging off the old route is measured along the old route too.
+    #
+    # get_safe_hex_distance opens the hex itself if it is a barrier in the maze it is measured
+    # in, which is what a hex the barrier change just blocked needs: the route to where it sits
+    # is the same whether or not the rat can stand there. A hex on an island, though, has no
+    # route to it at all, so it is left out and reads as -100 like any other hex without a
+    # distance.
+    distance = {}
+    for hex_id in set(maze_to_graph(old_maze)) | set(maze_to_graph(new_maze)):
+        hex_class = wide.get(hex_id)
+        maze = old_maze if hex_class == "old_path" else new_maze
+        hops = get_safe_hex_distance(maze, divergence_hex, hex_id)
+        if np.isinf(hops):
+            continue
+
+        # Negative on the approach side, positive past the divergence point. The sign comes
+        # from the wide before_divergence set so that a hex hanging off the approach corridor
+        # takes the sign of the corridor it hangs off, rather than a positive sign for being
+        # off-route.
+        distance[hex_id] = -hops if hex_class == "before_divergence" else hops
+
+    return strict, wide, distance
+
+
+@schema
+class HexMazeDecodedPositionHexBarrierChange(SpyglassMixin, dj.Computed):
+    """
+    Per-timepoint barrier change classification, built on HexMazeDecodedPositionHexV2.
+
+    This is to HexMazeDecodedHexPathBarrierChange what HexMazeDecodedPositionHexAnnotated is
+    to HexMazeDecodedHexPath: the same barrier change classes, but one row per timepoint
+    instead of one row per hex the trajectory passed through, so it can be filtered by speed,
+    spatial coverage, theta phase, etc. at each sample.
+
+    Unlike the other per-timepoint tables, this one stores ONLY its own annotation columns,
+    not a copy of its parent's dataframe -- one epoch is a few million samples, and V2's
+    columns are already stored once in V2. The rows line up with V2's one for one, in the same
+    order, so fetch1_dataframe_with_decode() joins the two back together on the time index.
+    Use fetch1_dataframe() when the annotations are all you need. The class columns are
+    stored as int8 codes into BARRIER_CHANGE_CLASSES for the same reason; fetch1_dataframe
+    maps them back to their names, so the codes never leave the stored file.
+
+    Stored columns:
+
+    Trial identifiers, filled for every trial in the epoch (-100 outside any trial):
+        block, block_trial_num, epoch_trial_num
+
+    Barrier change class of the rat's actual hex and of the decoded hex, each in a strict and
+    a wide flavour (see barrier_change_lookups). One of "before_divergence", "old_path",
+    "new_path", "after_convergence", "shared", "other", "barrier", or "None":
+        barrier_change_hex_class, barrier_change_hex_class_wide
+        decode_barrier_change_hex_class, decode_barrier_change_hex_class_wide
+
+    "barrier" means the hex is closed in the new maze and is not part of the old path either,
+    so the rat could not have been there under either maze -- only reachable via
+    `decode_hex_any`. "None" means no classification was made for that timepoint: it falls
+    outside any trial, or in a block with no barrier change to compare against (the first
+    block of the epoch, or a probability change block), or in the first trial of an epoch,
+    which has no start port.
+
+    Hex distance from the path divergence point, negative on the approach side (-100 where
+    there is no divergence point, or the hex is unreachable in the maze it is measured in):
+        hexes_from_divergence, decode_hexes_from_divergence
+
+    Only populates for epochs with at least one barrier change block.
+    """
+
+    definition = """
+    -> HexMazeDecodedPositionHexV2
+    ---
+    -> custom_AnalysisNwbfile
+    barrier_change_annotation_object_id: varchar(128)
+    """
+    
+    @property
+    def key_source(self):
+        # Only barrier change epochs have anything to classify
+        barrier_change_epochs = (HexMazeBlock & 'task_type = "barrier change"').proj()
+        return (HexMazeDecodedPositionHexV2 & barrier_change_epochs).proj()
+
+
+    def make(self, key):
+        # Skip if already populated
+        if self & key:
+            return
+        nwb_file = key["nwb_file_name"]
+        epoch = key["epoch"]
+
+        # Get all blocks for this epoch, ordered by block number
+        blocks = (HexMazeBlock & {"nwb_file_name": nwb_file, "epoch": epoch}).fetch(
+            as_dict=True, order_by="block"
+        )
+
+        # Check that this is a barrier change session
+        if not any(block["task_type"] == "barrier change" for block in blocks):
+            return
+
+        # Map each block to the maze pair that defines its barrier change (old_maze, current_maze)
+        block_mazes = {}
+        for i, block in enumerate(blocks):
+            old_maze = blocks[i - 1]["config_id"] if i > 0 else None
+            block_mazes[block["block"]] = (old_maze, block["config_id"])
+
+        # Get actual+decoded position and hex df
+        decode_df = (HexMazeDecodedPositionHexV2 & key).fetch1_dataframe()
+
+        # One row per V2 row, sharing its time index (-100 for numeric, "None" for string,
+        # to avoid nan/HDF5 datatype issues). Rows outside any trial keep these defaults
+        n = len(decode_df)
+        annotations = pd.DataFrame(
+            {
+                "block": np.full(n, -100),
+                "block_trial_num": np.full(n, -100),
+                "epoch_trial_num": np.full(n, -100),
+                "barrier_change_hex_class": ["None"] * n,
+                "barrier_change_hex_class_wide": ["None"] * n,
+                "decode_barrier_change_hex_class": ["None"] * n,
+                "decode_barrier_change_hex_class_wide": ["None"] * n,
+                "hexes_from_divergence": np.full(n, -100),
+                "decode_hexes_from_divergence": np.full(n, -100),
+            },
+            index=decode_df.index,
+        )
+
+        # Cache on (old_maze, new_maze, start_port, end_port) for speed
+        lookup_cache = {}
+
+        for trial in epoch_trials_with_bounds(nwb_file, epoch):
+            old_maze, new_maze = block_mazes[trial["block"]]
+            start_port, end_port = trial["start_port"], trial["end_port"]
+
+            # Filter to this trial's timepoints
+            idx = decode_df.loc[trial["start_time"]:trial["end_time"]].index
+            if not len(idx):
+                continue
+
+            # Trial identifiers go in for every trial so it's easy to filter the table
+            annotations.loc[idx, "block"] = trial["block"]
+            annotations.loc[idx, "block_trial_num"] = trial["block_trial_num"]
+            annotations.loc[idx, "epoch_trial_num"] = trial["epoch_trial_num"]
+
+            # No maze to compare against (first block), or no start port (the first trial)
+            if old_maze is None or start_port == "None":
+                continue
+
+            # Add this pair to our cache if it doesn't already exist, else just fetch
+            cache_key = (old_maze, new_maze, start_port, end_port)
+            if cache_key not in lookup_cache:
+                lookup_cache[cache_key] = barrier_change_lookups(old_maze, new_maze, start_port, end_port)
+            strict, wide, distance = lookup_cache[cache_key]
+
+            # Every hex open in the new maze gets a class, so anything left is a barrier
+            # (which only decode_hex_any reaches)
+            # TODO add a check if trial hex is every mapped to barrier?
+            trial_hex = decode_df.loc[idx, "hex"]
+            trial_decode_hex = decode_df.loc[idx, "decode_hex_any"]
+
+            annotations.loc[idx, "barrier_change_hex_class"] = trial_hex.map(strict).fillna("barrier")
+            annotations.loc[idx, "barrier_change_hex_class_wide"] = trial_hex.map(wide).fillna("barrier")
+            annotations.loc[idx, "decode_barrier_change_hex_class"] = trial_decode_hex.map(strict).fillna("barrier")
+            annotations.loc[idx, "decode_barrier_change_hex_class_wide"] = trial_decode_hex.map(wide).fillna("barrier")
+
+            annotations.loc[idx, "hexes_from_divergence"] = (
+                trial_hex.map(distance).fillna(-100).astype(int)
+            )
+            annotations.loc[idx, "decode_hexes_from_divergence"] = (
+                trial_decode_hex.map(distance).fillna(-100).astype(int)
+            )
+
+        # Store the class columns as their index into BARRIER_CHANGE_CLASSES, and squeeze the
+        # counters down to int16 (blocks, trials and hex distances are all far inside its
+        # range). Together these take the stored file from ~800 MB an epoch to ~50 MB
+        codes = {name: code for code, name in enumerate(BARRIER_CHANGE_CLASSES)}
+        for column in self._class_columns:
+            annotations[column] = annotations[column].map(codes).astype("int8")
+        for column in self._counter_columns:
+            annotations[column] = annotations[column].astype("int16")
+
+        # Save time as a column instead of index (NWB requires integer index)
+        annotations = annotations.reset_index()
+
+        # Create an AnalysisNwbfile with a link to the original nwb and add the df
+        with custom_AnalysisNwbfile().build(nwb_file) as builder:
+            key["barrier_change_annotation_object_id"] = builder.add_nwb_object(
+                annotations, "barrier_change_annotation"
+            )
+            key["analysis_file_name"] = builder.analysis_file_name
+
+        self.insert1(key, skip_duplicates=True)
+
+    # Stored as int8 codes into BARRIER_CHANGE_CLASSES, mapped back by fetch1_dataframe
+    _class_columns = [
+        "barrier_change_hex_class",
+        "barrier_change_hex_class_wide",
+        "decode_barrier_change_hex_class",
+        "decode_barrier_change_hex_class_wide",
+    ]
+
+    # Stored as int16 rather than the int64 pandas would default to
+    _counter_columns = [
+        "block",
+        "block_trial_num",
+        "epoch_trial_num",
+        "hexes_from_divergence",
+        "decode_hexes_from_divergence",
+    ]
+
+    def fetch1_dataframe(self):
+        # Just the barrier change annotations, time-indexed, with the class codes mapped back
+        # to their names so callers never see the stored representation
+        annotations = self.fetch_nwb()[0]["barrier_change_annotation"].set_index("time")
+        class_names = np.array(BARRIER_CHANGE_CLASSES)
+        for column in self._class_columns:
+            annotations[column] = class_names[annotations[column].to_numpy()]
+        return annotations
+
+    def fetch1_dataframe_with_decode(self):
+        """The annotations joined back onto the full HexMazeDecodedPositionHexV2 dataframe.
+
+        The two are stored as one row per sample in the same order off the same source, so
+        their time indexes are identical and the join is exact.
+        Returns:
+            pd.DataFrame: Every HexMazeDecodedPositionHexV2 column plus every annotation
+                column, indexed by time.
+        """
+        annotations = self.fetch1_dataframe()
+        decode_df = (HexMazeDecodedPositionHexV2 & self.fetch1("KEY")).fetch1_dataframe()
+        if not annotations.index.equals(decode_df.index):
+            raise ValueError(
+                "Barrier change annotations do not line up with HexMazeDecodedPositionHexV2 "
+                f"({len(annotations)} rows vs {len(decode_df)}). The V2 entry was most likely "
+                "repopulated after these annotations were computed -- delete and repopulate "
+                "this entry."
+            )
+        return decode_df.join(annotations)
 
 
 @schema
@@ -1467,7 +1836,8 @@ class HexMazeJunctionDecode(SpyglassMixin, dj.Computed):
         annotated_df["decode_junction_direction"] = "None"
 
         # Get trials for this nwb+epoch
-        trials = HexMazeBlock().Trial() & {"nwb_file_name": nwb_file, "epoch": epoch}
+        trials = epoch_trials_with_bounds(nwb_file, epoch)
+        maze_of_block = maze_by_block(nwb_file, epoch)
 
         # Caches for per-maze computations (avoid recomputing across trials in same block)
         junction_lr_cache = {}       # maze -> junction left/right map
@@ -1508,24 +1878,8 @@ class HexMazeJunctionDecode(SpyglassMixin, dj.Computed):
                 return "ambiguous"
 
         for trial in trials:
-            # Get trial time bounds
-            trial_start, trial_end = (
-                sgc.IntervalList
-                & {
-                    "nwb_file_name": trial["nwb_file_name"],
-                    "interval_list_name": trial["interval_list_name"],
-                }
-            ).fetch1("valid_times")[0]
-
-            # Get maze configuration for this block
-            maze = (
-                HexMazeBlock()
-                & {
-                    "nwb_file_name": trial["nwb_file_name"],
-                    "block": trial["block"],
-                    "epoch": trial["epoch"],
-                }
-            ).fetch1("config_id")
+            trial_start, trial_end = trial["start_time"], trial["end_time"]
+            maze = maze_of_block[trial["block"]]
 
             # Get per-maze data structures
             junction_hexes = _get_junction_set(maze)
@@ -1613,7 +1967,7 @@ class HexMazeJunctionDecode(SpyglassMixin, dj.Computed):
                 for j in range(i - 1, -1, -1):
                     prev_seg = segments[j]
                     prev_hex = prev_seg["hex"]
-                    # Stop if we hit another junction — it owns its own timepoints
+                    # Stop if we hit another junction, since it owns its own timepoints
                     if prev_hex in junction_hexes:
                         break
                     # Compute graph distance from this hex to the junction
