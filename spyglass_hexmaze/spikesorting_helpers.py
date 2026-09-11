@@ -80,6 +80,29 @@ def get_electrode_ids(nwb_file_name: str) -> list:
     return electrodes["electrode_id"].unique().tolist()
 
 
+def sort_group_electrodes(nwb_file_name: str) -> dict:
+    """Electrode IDs in each sort group of a session.
+
+    Lets us say which electrodes a unit could have come from. v1 (Berke lab) units have a
+    real peak channel so this is mainly for v0 (Frank lab) sessions, where the best we can
+    do is "somewhere on this tetrode / shank".
+
+    Parameters:
+        nwb_file_name (str): NWB file to look up
+
+    Returns:
+        dict[int, list[int]]: sort_group_id -> electrode IDs in that sort group.
+    """
+    SortGroupTable = sort_group_table(nwb_file_name)
+    electrodes = pd.DataFrame(
+        (SortGroupTable * SortGroupTable.SortGroupElectrode & {"nwb_file_name": nwb_file_name})
+        .fetch(as_dict=True))
+    if electrodes.empty:
+        return {}
+    return {int(sort_group_id): sorted(set(rows["electrode_id"].astype(int)))
+            for sort_group_id, rows in electrodes.groupby("sort_group_id")}
+
+
 def fetch_good_units(
     nwb_file_name: str,
     curation_id: int = None,
@@ -243,18 +266,31 @@ def electrodes_with_units(units: pd.DataFrame) -> list:
 def fetch_electrode_geometry(nwb_file_name: str) -> pd.DataFrame:
     """Probe geometry (rel_x, rel_y) and bad-channel tag for every electrode in a session.
 
+    IMPORTANT: rel_x / rel_y come from Probe.Electrode, which is keyed on
+    (probe_type, probe_shank, probe_electrode) only -- they are coordinates WITHIN one probe,
+    not coordinates within the animal. A session implanted with several probes of the same
+    model therefore has several electrodes sharing one (rel_x, rel_y): a Frank lab session
+    with 4 identical 128-channel probes has 512 electrodes on just 128 distinct positions.
+    Plotting rel_x / rel_y directly hides all but one electrode per position, so anything
+    laying out a whole session has to separate the probes first -- which is what the
+    electrode_group_name and probe_shank columns are for (electrode_group_name is the probe).
+    Berke lab sessions use a single probe model whose rel_x already spans every group, so
+    their positions are unique and can be plotted as-is.
+
     Parameters:
         nwb_file_name (str): NWB file to fetch geometry for
 
     Returns:
         pd.DataFrame: Indexed by electrode name (a STRING, matching how electrodes are named
             in the theta tables) and sorted numerically, with columns rel_x, rel_y,
-            bad_channel, and is_bad. bad_channel is stored inconsistently across sessions
-            ("True" / "1" / 1), so is_bad normalizes it to a boolean.
+            bad_channel, is_bad, electrode_group_name and probe_shank. bad_channel is stored
+            inconsistently across sessions ("True" / "1" / 1), so is_bad normalizes it to a
+            boolean.
     """
     geometry = pd.DataFrame(
         (sgc.Electrode * sgc.Probe.Electrode & {"nwb_file_name": nwb_file_name})
-        .fetch("name", "rel_x", "rel_y", "bad_channel", as_dict=True)
+        .fetch("name", "rel_x", "rel_y", "bad_channel", "electrode_group_name", "probe_shank",
+               as_dict=True)
     ).set_index("name")
     geometry = geometry.loc[sorted(geometry.index, key=int)]
     geometry["is_bad"] = geometry["bad_channel"].astype(str).str.lower().isin(["true", "1"])
